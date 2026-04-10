@@ -1,0 +1,12 @@
+result*
+AutoDL
+autodl
+useful
+data
+config
+*.vtk
+*.sh
+*.json
+*.pdf
+.claude
+__pycache__
