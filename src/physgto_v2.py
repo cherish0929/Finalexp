@@ -1,3 +1,0 @@
-# backward-compat shim — real implementation moved to src/model/physgto_v2.py
-from src.model.physgto_v2 import *  # noqa: F401, F403
-from src.model.physgto_v2 import Model  # noqa: F401
