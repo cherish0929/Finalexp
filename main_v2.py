@@ -32,9 +32,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 
-from src.dataset_fast import AeroGtoDataset
-from src.dataset_2d import AeroGtoDataset2D
-from src.dataset_cut_fast import CutAeroGtoDataset
+from src.dataset import AeroGtoDataset, AeroGtoDataset2D, CutAeroGtoDataset
 from src.train import train, validate, get_train_loss, _init_region_agg, _accumulate_region, _finalize_region
 from src.utils import set_seed, init_weights, parse_args, load_json_config
 
@@ -207,7 +205,7 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
     normalizer.to(device)
     scaler = GradScaler('cuda') if use_amp else None
 
-    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3")
+    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max")
 
     pbar = tqdm(train_dataloader, desc="  Train(PF)", unit="bt", leave=True, ncols=120, colour='cyan')
 
@@ -397,7 +395,7 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
     normalizer.to(device)
     scaler = GradScaler('cuda') if use_amp else None
 
-    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3")
+    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max")
 
     pbar = tqdm(train_dataloader, desc="  Train", unit="bt", leave=True, ncols=120, colour='green')
     for batch in pbar:
@@ -546,7 +544,7 @@ def get_dataloader(args, path_record, device_type, pf_extra_max=0):
             Datasetclass = CutAeroGtoDataset
         else:
             Datasetclass = AeroGtoDataset
-    elif space_dim == 2:
+    else:  # space_dim == 2
         Datasetclass = AeroGtoDataset2D
 
     # Inject pf_extra_max into data_cfg so train dataset can load extra time steps
@@ -615,54 +613,10 @@ def get_dataloader(args, path_record, device_type, pf_extra_max=0):
 
 
 def get_model(args, device, cond_dim, default_dt):
+    from src.model import build_model
     model_cfg = args.model
-    model_name = model_cfg.get("name", "PhysGTO")
 
-    if model_name == "PhysGTO":
-        from src.physgto import Model
-    elif model_name == "PhysGTO_v2":
-        from src.physgto_v2 import Model
-    elif model_name == "gto_res":
-        from src.physgto_res import Model
-    elif model_name == "gto_lnn":
-        from src.gto_lnn import Model
-    elif model_name == "gto_attnres_multi":
-        from src.physgto_attnres_multi import Model
-    elif model_name == "gto_attnres_multi_v2":
-        from src.physgto_attnres_multi_v2 import Model
-    elif model_name == "gto_res_attnres":
-        from src.physgto_res_attnres import Model
-    elif model_name == "gto_attnres_multi_v3":
-        from src.physgto_attnres_multi_v3 import Model
-
-    common_kwargs = dict(
-        space_size=model_cfg.get("space_size", 3),
-        pos_enc_dim=model_cfg.get("pos_enc_dim", 5),
-        cond_dim=cond_dim,
-        N_block=model_cfg.get("N_block", 4),
-        in_dim=model_cfg.get("in_dim", 4),
-        out_dim=model_cfg.get("out_dim", 4),
-        enc_dim=model_cfg.get("enc_dim", 128),
-        n_head=model_cfg.get("n_head", 4),
-        n_token=model_cfg.get("n_token", 64),
-        dt=model_cfg.get("dt", default_dt),
-    )
-
-    if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres", "gto_attnres_multi_v3"):
-        common_kwargs["n_fields"] = model_cfg.get("n_fields", model_cfg.get("in_dim", 2))
-        common_kwargs["cross_attn_heads"] = model_cfg.get("cross_attn_heads", 4)
-
-    if model_name in ("gto_attnres_multi_v2", "gto_res_attnres"):
-        common_kwargs["attn_res_mode"] = model_cfg.get("attn_res_mode", "block_inter")
-
-    if model_name in ("PhysGTO_v2", "gto_attnres_multi_v3"):
-        common_kwargs["spatial_dim"] = model_cfg.get("spatial_dim", 10)
-        common_kwargs["pos_x_boost"] = model_cfg.get("pos_x_boost", 2)
-
-    if model_name == "gto_attnres_multi_v3":
-        common_kwargs["n_latent"] = model_cfg.get("n_latent", 4)
-
-    model = Model(**common_kwargs).to(device)
+    model = build_model(model_cfg, cond_dim, default_dt, device)
 
     load_path = model_cfg.get("load_path")
     checkpoint = None

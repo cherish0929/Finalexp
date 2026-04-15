@@ -28,7 +28,7 @@ from tqdm import tqdm
 from pathlib import Path
 from torch.amp import autocast
 
-from src.dataset_fast import AeroGtoDataset
+from src.dataset import AeroGtoDataset
 from src.utils import load_json_config
 
 
@@ -96,59 +96,12 @@ def _interface_band_mae(pred_np, gt_np, band_lo=0.2, band_hi=0.8):
 
 
 # ────────────────────────────────────────────
-#  Model builder (与 inference_v1 相同)
+#  Model builder
 # ────────────────────────────────────────────
 
 def _build_model(model_cfg, cond_dim, default_dt, device):
-    model_name = model_cfg.get("name", "PhysGTO")
-
-    if model_name == "PhysGTO":
-        from src.physgto import Model
-    elif model_name == "PhysGTO_v2":
-        from src.physgto_v2 import Model
-    elif model_name == "gto_res":
-        from src.physgto_res import Model
-    elif model_name == "gto_lnn":
-        from src.gto_lnn import Model
-    elif model_name == "gto_attnres_multi":
-        from src.physgto_attnres_multi import Model
-    elif model_name == "gto_attnres_multi_v2":
-        from src.physgto_attnres_multi_v2 import Model
-    elif model_name == "gto_res_attnres":
-        from src.physgto_res_attnres import Model
-    elif model_name == "gto_attnres_multi_v3":
-        from src.physgto_attnres_multi_v3 import Model
-    else:
-        raise ValueError(f"Unknown model name: {model_name}")
-
-    kwargs = dict(
-        space_size=model_cfg.get("space_size", 3),
-        pos_enc_dim=model_cfg.get("pos_enc_dim", 5),
-        cond_dim=cond_dim,
-        N_block=model_cfg.get("N_block", 4),
-        in_dim=model_cfg.get("in_dim", 4),
-        out_dim=model_cfg.get("out_dim", 4),
-        enc_dim=model_cfg.get("enc_dim", 128),
-        n_head=model_cfg.get("n_head", 4),
-        n_token=model_cfg.get("n_token", 64),
-        dt=model_cfg.get("dt", default_dt),
-    )
-
-    if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres", "gto_attnres_multi_v3"):
-        kwargs["n_fields"] = model_cfg.get("n_fields", model_cfg.get("in_dim", 2))
-        kwargs["cross_attn_heads"] = model_cfg.get("cross_attn_heads", 4)
-
-    if model_name in ("gto_attnres_multi_v2", "gto_res_attnres"):
-        kwargs["attn_res_mode"] = model_cfg.get("attn_res_mode", "block_inter")
-
-    if model_name in ("PhysGTO_v2", "gto_attnres_multi_v3"):
-        kwargs["spatial_dim"] = model_cfg.get("spatial_dim", 10)
-        kwargs["pos_x_boost"] = model_cfg.get("pos_x_boost", 2)
-
-    if model_name == "gto_attnres_multi_v3":
-        kwargs["n_latent"] = model_cfg.get("n_latent", 4)
-
-    return Model(**kwargs).to(device)
+    from src.model import build_model
+    return build_model(model_cfg, cond_dim, default_dt, device)
 
 
 # ════════════════════════════════════════════
@@ -255,7 +208,7 @@ class AirFieldPredictor:
         edges = sample["edges"].unsqueeze(0).to(self.device)
         time_seq = sample["time_seq"].unsqueeze(0).to(self.device)
         conditions = sample["conditions"].unsqueeze(0).to(self.device).float()
-        _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3")
+        _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max")
         if _use_spatial:
             spatial_inform = sample["spatial_inform"].unsqueeze(0).to(self.device)
         dt = sample["dt"]

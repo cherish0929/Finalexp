@@ -64,9 +64,7 @@ class DualLogger:
 def get_dataloader_eval(args, device_type):
     """与 main_v2.get_dataloader 相同, 但不写日志文件。"""
     from torch.utils.data import DataLoader, Subset
-    from src.dataset_fast import AeroGtoDataset
-    from src.dataset_2d import AeroGtoDataset2D
-    from src.dataset_cut_fast import CutAeroGtoDataset
+    from src.dataset import AeroGtoDataset, AeroGtoDataset2D, CutAeroGtoDataset
 
     data_cfg = args.data
     model_cfg = args.model
@@ -115,56 +113,10 @@ def load_model_and_checkpoint(args, device, cond_dim, default_dt):
     返回 (model, checkpoint_info_dict) 或在找不到 checkpoint 时返回 (None, error_msg)。
     """
     from src.utils import init_weights
+    from src.model import build_model
     model_cfg = args.model
-    model_name = model_cfg.get("name", "PhysGTO")
 
-    if model_name == "PhysGTO":
-        from src.physgto import Model
-    elif model_name == "PhysGTO_v2":
-        from src.physgto_v2 import Model
-    elif model_name == "gto_res":
-        from src.physgto_res import Model
-    elif model_name == "gto_lnn":
-        from src.gto_lnn import Model
-    elif model_name == "gto_attnres_multi":
-        from src.physgto_attnres_multi import Model
-    elif model_name == "gto_attnres_multi_v2":
-        from src.physgto_attnres_multi_v2 import Model
-    elif model_name == "gto_res_attnres":
-        from src.physgto_res_attnres import Model
-    elif model_name == "gto_attnres_multi_v3":
-        from src.physgto_attnres_multi_v3 import Model
-    else:
-        raise ValueError(f"Unknown model name: {model_name}")
-
-    common_kwargs = dict(
-        space_size=model_cfg.get("space_size", 3),
-        pos_enc_dim=model_cfg.get("pos_enc_dim", 5),
-        cond_dim=cond_dim,
-        N_block=model_cfg.get("N_block", 4),
-        in_dim=model_cfg.get("in_dim", 4),
-        out_dim=model_cfg.get("out_dim", 4),
-        enc_dim=model_cfg.get("enc_dim", 128),
-        n_head=model_cfg.get("n_head", 4),
-        n_token=model_cfg.get("n_token", 64),
-        dt=model_cfg.get("dt", default_dt),
-    )
-
-    if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres", "gto_attnres_multi_v3"):
-        common_kwargs["n_fields"] = model_cfg.get("n_fields", model_cfg.get("in_dim", 2))
-        common_kwargs["cross_attn_heads"] = model_cfg.get("cross_attn_heads", 4)
-
-    if model_name in ("gto_attnres_multi_v2", "gto_res_attnres"):
-        common_kwargs["attn_res_mode"] = model_cfg.get("attn_res_mode", "block_inter")
-
-    if model_name in ("PhysGTO_v2", "gto_attnres_multi_v3"):
-        common_kwargs["spatial_dim"] = model_cfg.get("spatial_dim", 10)
-        common_kwargs["pos_x_boost"] = model_cfg.get("pos_x_boost", 2)
-
-    if model_name == "gto_attnres_multi_v3":
-        common_kwargs["n_latent"] = model_cfg.get("n_latent", 4)
-
-    model = Model(**common_kwargs).to(device)
+    model = build_model(model_cfg, cond_dim, default_dt, device)
 
     # 加载 checkpoint
     path_nn = args.save_path + "/nn"
