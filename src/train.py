@@ -629,7 +629,7 @@ def validate(args, model, val_dataloader, device, normalizer, epoch):
     fields = args.data.get("fields", ["T"])
     use_amp, check_point = args.train.get("use_amp", False), args.train.get("check_point", False)
     model_name = args.model.get("name", "PhysGTO")
-    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3")
+    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max")
     agg = {}
     for key in ["L2", "mean_l2", "RMSE"]:
         if key == "L2" or key == "RMSE":

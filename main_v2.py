@@ -172,18 +172,19 @@ class WarmupCosineScheduler:
 # Pushforward Training
 # =============================================================================
 
-def train_pushforward(args, model, train_dataloader, optim, device, normalizer, extra_steps, ema=None):
+def train_pushforward(args, model, train_dataloader, optim, device, normalizer, extra_steps, ema=None, ckpt_threshold=None):
     """
     Pushforward training: extend rollout beyond horizon_train by extra_steps.
     Only backpropagate through the extra steps (the model is already good at the original horizon).
     This forces the model to learn to correct its own errors.
     """
-    from torch.amp import GradScaler, autocast
+    from torch.amp import autocast
 
     base_horizon = args.data.get("horizon_train", 1)
     fields = args.data.get("fields", ["T"])
     use_amp = args.train.get("use_amp", False)
-    check_point = args.train.get("check_point", False)
+    # ckpt_threshold overrides config check_point when provided
+    check_point = ckpt_threshold if ckpt_threshold is not None else args.train.get("check_point", False)
     weight_loss = args.train.get("weight_loss", {"enable": False})
     grad_loss_weight = args.train.get("grad_loss_weight", 8.0)
     model_name = args.model.get("name", "PhysGTO")
@@ -203,7 +204,6 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
 
     model.train()
     normalizer.to(device)
-    scaler = GradScaler('cuda') if use_amp else None
 
     _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max")
 
@@ -279,11 +279,17 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
                 torch.cuda.empty_cache()
                 continue
 
-            scaler.scale(total_loss).backward()
-            scaler.unscale_(optim)
+            # bf16 autocast without GradScaler
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
-            scaler.step(optim)
-            scaler.update()
+            # Skip step if any gradient is non-finite
+            if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
+                optim.zero_grad()
+                del predict_hat, costs, loss_base, total_loss
+                if 'costs_pf' in locals(): del costs_pf, loss_pf
+                torch.cuda.empty_cache()
+                continue
+            optim.step()
             optim.zero_grad()
             if ema is not None:
                 ema.update(model)
@@ -328,6 +334,13 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
 
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
+            # Skip step if any gradient is non-finite
+            if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
+                optim.zero_grad()
+                del predict_hat, costs, loss_base, total_loss
+                if 'costs_pf' in locals(): del costs_pf, loss_pf
+                torch.cuda.empty_cache()
+                continue
             optim.step()
             optim.zero_grad()
             if ema is not None:
@@ -366,14 +379,15 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
 # Patched train function with configurable grad_loss_weight
 # =============================================================================
 
-def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None):
+def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None, ckpt_threshold=None):
     """train() with configurable grad_loss_weight instead of hardcoded 8.0"""
-    from torch.amp import GradScaler, autocast
+    from torch.amp import autocast
 
     horizon = args.data.get("horizon_train", 1) if isinstance(args.data, dict) else getattr(args, "horizon_train", 1)
     fields = args.data.get("fields", ["T"])
     use_amp = args.train.get("use_amp", False)
-    check_point = args.train.get("check_point", False)
+    # ckpt_threshold overrides config check_point when provided (set by _probe_ckpt_threshold)
+    check_point = ckpt_threshold if ckpt_threshold is not None else args.train.get("check_point", False)
     weight_loss = args.train.get("weight_loss", {"enable": False})
     grad_loss_weight = args.train.get("grad_loss_weight", 8.0)
     model_name = args.model.get("name", "PhysGTO")
@@ -393,7 +407,6 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
 
     model.train()
     normalizer.to(device)
-    scaler = GradScaler('cuda') if use_amp else None
 
     _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max")
 
@@ -445,11 +458,16 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
                 torch.cuda.empty_cache()
                 continue
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optim)
+            # bf16 autocast without GradScaler — more stable than fp16+scaler
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
-            scaler.step(optim)
-            scaler.update()
+            # Skip step if any gradient is non-finite (prevents corrupting weights)
+            if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
+                optim.zero_grad()
+                del predict_hat, costs, loss
+                torch.cuda.empty_cache()
+                continue
+            optim.step()
             optim.zero_grad()
             if ema is not None:
                 ema.update(model)
@@ -479,6 +497,12 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
+            # Skip step if any gradient is non-finite
+            if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
+                optim.zero_grad()
+                del predict_hat, costs, loss
+                torch.cuda.empty_cache()
+                continue
             optim.step()
             optim.zero_grad()
             if ema is not None:
@@ -519,6 +543,117 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
     if has_region:
         _finalize_region(agg, fields, agg["num"], include_loss=True)
     return agg
+
+
+# =============================================================================
+# Adaptive checkpoint threshold probing
+# =============================================================================
+
+def _probe_ckpt_threshold(model, first_batch, device, horizon, args, path_record="", run_name=""):
+    """
+    Binary-search for the maximum number of autoregressive steps that can run
+    without gradient checkpointing before OOM.
+
+    Returns an int k (0 <= k <= horizon):
+      - k == horizon : no checkpointing needed at all
+      - 0 <= k < horizon : use ckp from step k onwards; steps [0, k) run free
+      - returns True if even full ckp OOMs (fall back to config)
+
+    The returned value is passed directly as check_point to autoregressive(),
+    which interprets it as:
+      check_point is True  → all steps use ckp
+      type(check_point) is int and t >= check_point → ckp from step k onwards
+    """
+    if not torch.cuda.is_available():
+        return False
+    if horizon <= 1:
+        return False
+
+    from torch.amp import autocast
+
+    use_amp = args.train.get("use_amp", False)
+    model_name = args.model.get("name", "PhysGTO")
+    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max")
+
+    # Prepare a single-sample probe batch (use first sample only to minimise memory)
+    dt = first_batch['dt'][:1].to(device)
+    state = first_batch["state"][:1, :horizon + 1].to(device)
+    node_pos = first_batch["node_pos"][:1].to(device)
+    edges = first_batch["edges"][:1].to(device)
+    time_seq = first_batch["time_seq"][:1, :horizon].to(device)
+    conditions = first_batch["conditions"][:1].to(device).float()
+    spatial_inform = None
+    if _use_spatial and "spatial_inform" in first_batch:
+        spatial_inform = first_batch["spatial_inform"][:1].to(device)
+
+    def _try(ckpt_val):
+        """Run forward+backward with given check_point value. Returns True on success."""
+        torch.cuda.empty_cache()
+        try:
+            model.train()
+            if use_amp:
+                with autocast(device_type="cuda", dtype=torch.bfloat16):
+                    if _use_spatial and spatial_inform is not None:
+                        out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
+                                                   spatial_inform, conditions, dt, ckpt_val)
+                    else:
+                        out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
+                                                   conditions, dt, ckpt_val)
+            else:
+                if _use_spatial and spatial_inform is not None:
+                    out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
+                                               spatial_inform, conditions, dt, ckpt_val)
+                else:
+                    out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
+                                               conditions, dt, ckpt_val)
+            loss = out.float().sum()
+            loss.backward()
+            model.zero_grad(set_to_none=True)
+            del out, loss
+            torch.cuda.empty_cache()
+            return True
+        except torch.cuda.OutOfMemoryError:
+            model.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            return False
+        except Exception:
+            model.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            return False
+
+    def _log(msg):
+        print(msg)
+        if path_record and run_name:
+            try:
+                with open(f"{path_record}/{run_name}_training_log.txt", "a") as f:
+                    f.write(msg + "\n")
+            except Exception:
+                pass
+
+    _log(f"[CKP Probe] Probing checkpoint threshold (horizon={horizon}) ...")
+
+    # Step 1: try without any checkpointing
+    if _try(False):
+        _log(f"[CKP Probe] No OOM without ckp → ckpt_threshold={horizon} (no ckp used)")
+        return horizon  # no ckp needed
+
+    # Step 2: try with full checkpointing
+    if not _try(True):
+        _log(f"[CKP Probe] OOM even with full ckp → falling back to config check_point")
+        return True  # let training handle it (will likely OOM, but that's the user's config)
+
+    # Step 3: binary search for max k such that _try(k) succeeds
+    # k=0 ≡ True (all ckp, known to succeed); k=horizon ≡ False (no ckp, known to fail)
+    lo, hi = 0, horizon - 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _try(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+
+    _log(f"[CKP Probe] ckpt_threshold={lo}: steps [0,{lo}) free, steps [{lo},{horizon}) use ckp")
+    return lo
 
 
 # =============================================================================
@@ -713,6 +848,22 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
     if pf_enable:
         print(f"Pushforward: ON (start={pf_start}, extra_max={pf_extra_max}, ramp={pf_ramp})")
 
+    # ---- Adaptive checkpoint threshold ----
+    # Probe once with the first batch to find the max steps that fit without ckp.
+    # This overrides the config check_point for the entire training run.
+    horizon_train = args.data.get("horizon_train", 1)
+    try:
+        _first_batch = next(iter(train_dataloader))
+        ckpt_threshold = _probe_ckpt_threshold(
+            model, _first_batch, device, horizon_train, args,
+            path_record=path_record, run_name=args.name
+        )
+        del _first_batch
+        torch.cuda.empty_cache()
+    except Exception as _probe_exc:
+        print(f"[CKP Probe] Probing failed ({_probe_exc}), falling back to config check_point.")
+        ckpt_threshold = None  # fall back to config
+
     # ---- Resume ----
     start_epoch, best_val_error = 0, float("inf")
 
@@ -742,6 +893,8 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         file.write(f"EMA: decay=0.998\n")
         file.write(f"Pushforward: enable={pf_enable}\n")
         file.write(f"grad_loss_weight: {args.train.get('grad_loss_weight', 8.0)}\n")
+        file.write(f"AMP: bf16 autocast (no GradScaler)\n")
+        file.write(f"ckpt_threshold: {ckpt_threshold} (horizon={horizon_train})\n")
 
     # ---- Early-stop on repeated NaN/skip failures ----
     consecutive_skip_errors = 0
@@ -780,12 +933,12 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
             if use_pushforward:
                 train_error = train_pushforward(
                     args, model, train_dataloader, optimizer, device, normalizer,
-                    extra_steps=pf_extra, ema=ema
+                    extra_steps=pf_extra, ema=ema, ckpt_threshold=ckpt_threshold
                 )
             else:
                 train_error = train_v2(
                     args, model, train_dataloader, optimizer, device, normalizer,
-                    ema=ema
+                    ema=ema, ckpt_threshold=ckpt_threshold
                 )
         except torch.cuda.OutOfMemoryError as e:
             torch.cuda.empty_cache()

@@ -456,6 +456,14 @@ class AeroGtoDataset(Dataset):
         state_np, time_seq = self._load_window(path, meta["indices"], start_idx)
         state = torch.from_numpy(state_np)  # [T, N, C]
 
+        liquid_cut = self.config.get("liquid_cut", False)
+        if liquid_cut:
+            node_y = meta["node_pos"][:, 1]
+            y_cutoff_mask = node_y > 1e-4 + 1e-6
+            for i, field in enumerate(self.fields):
+                if field == "gamma_liquid":
+                    state[..., i][:, y_cutoff_mask] = 0.0
+
         active_mask = build_active_mask(state_np, self.fields, self.mask_cfg)
 
         if self.normalize:

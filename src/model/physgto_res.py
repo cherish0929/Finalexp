@@ -409,12 +409,12 @@ class Model(nn.Module):
             def custom_forward(s_t, t_i):
                 return self.forward(s_t, node_pos, edges, t_i, conditions, pos_enc, c_enc, dt)
             
-            if check_point:
+            if check_point is True or (type(check_point) is int and t >= check_point):
                 if state_t.requires_grad == False and state_t.is_floating_point():
                     state_t.requires_grad_()
 
                 state_pred = checkpoint(custom_forward, state_t, time_i, use_reentrant=False)
-            
+
             else:
                 state_pred = self.forward(state_t, node_pos, edges, time_i, conditions, pos_enc, c_enc, dt)
 
