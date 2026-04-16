@@ -916,6 +916,24 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
             file.write(_warn_msg + "\n")
 
+    def _save_interrupt_ckpt(interrupt_epoch):
+        if not args.if_save:
+            return None
+        curtime = datetime.now().strftime("%m-%d_%H-%M")
+        ckpt = {
+            'epoch': interrupt_epoch,
+            'state_dict': model.state_dict(),
+            'ema_shadow': ema.shadow,
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'learning_rate': optimizer.param_groups[0]['lr'],
+            'best_val_error': best_val_error,
+            'config': args
+        }
+        interrupt_path = f"{path_nn}/{args.name}_interrupt_ep{interrupt_epoch}_{curtime}.pt"
+        torch.save(ckpt, interrupt_path)
+        return interrupt_path
+
     # ==================== Training Loop ====================
     for epoch in range(start_epoch, EPOCH):
         start_time = time.time()
@@ -940,6 +958,23 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
                     args, model, train_dataloader, optimizer, device, normalizer,
                     ema=ema, ckpt_threshold=ckpt_threshold
                 )
+        except KeyboardInterrupt:
+            interrupt_epoch = epoch + 1
+            if getattr(ema, "backup", None):
+                ema.restore(model)
+            interrupt_path = _save_interrupt_ckpt(interrupt_epoch)
+            if interrupt_path is not None:
+                print(f"[INTERRUPTED] Ctrl+C at epoch {interrupt_epoch}/{EPOCH}. Saved: {interrupt_path}")
+            else:
+                print(f"[INTERRUPTED] Ctrl+C at epoch {interrupt_epoch}/{EPOCH}. args.if_save=False, checkpoint not saved.")
+            with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
+                file.write(f"[INTERRUPTED] Ctrl+C at epoch {interrupt_epoch}/{EPOCH}\n")
+                if interrupt_path is not None:
+                    file.write(f"Saved interrupt checkpoint: {interrupt_path}\n")
+                else:
+                    file.write("args.if_save=False, checkpoint not saved.\n")
+            writer.close()
+            return
         except torch.cuda.OutOfMemoryError as e:
             torch.cuda.empty_cache()
             _write_error(path_record, args.name, e,
@@ -1073,6 +1108,22 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
                 test_error = validate(args, model, test_dataloader, device, normalizer, epoch + 1)
                 ema.restore(model)
                 torch.cuda.empty_cache()
+            except KeyboardInterrupt:
+                ema.restore(model)
+                interrupt_epoch = epoch + 1
+                interrupt_path = _save_interrupt_ckpt(interrupt_epoch)
+                if interrupt_path is not None:
+                    print(f"[INTERRUPTED] Ctrl+C at epoch {interrupt_epoch}/{EPOCH}. Saved: {interrupt_path}")
+                else:
+                    print(f"[INTERRUPTED] Ctrl+C at epoch {interrupt_epoch}/{EPOCH}. args.if_save=False, checkpoint not saved.")
+                with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
+                    file.write(f"[INTERRUPTED] Ctrl+C at epoch {interrupt_epoch}/{EPOCH}\n")
+                    if interrupt_path is not None:
+                        file.write(f"Saved interrupt checkpoint: {interrupt_path}\n")
+                    else:
+                        file.write("args.if_save=False, checkpoint not saved.\n")
+                writer.close()
+                return
             except torch.cuda.OutOfMemoryError as e:
                 ema.restore(model)
                 torch.cuda.empty_cache()
