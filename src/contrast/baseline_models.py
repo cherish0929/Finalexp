@@ -300,7 +300,7 @@ class GraphViTModel(_AutoregressiveMixin, nn.Module):
 
         if dt is None:
             dt = self.dt
-        elif dt.dim() == 1:
+        elif isinstance(dt, torch.Tensor) and dt.dim() == 1:
             dt = dt.view(-1, 1, 1)
 
         return state_in + dt * v_pred
@@ -458,7 +458,7 @@ class FNO3DModel(_AutoregressiveMixin, nn.Module):
 
         if dt is None:
             dt = self.dt
-        elif dt.dim() == 1:
+        elif isinstance(dt, torch.Tensor) and dt.dim() == 1:
             dt = dt.view(-1, 1, 1)
 
         return state_in + dt * v_pred
@@ -637,7 +637,7 @@ class UNet3DModel(_AutoregressiveMixin, nn.Module):
 
         if dt is None:
             dt = self.dt
-        elif dt.dim() == 1:
+        elif isinstance(dt, torch.Tensor) and dt.dim() == 1:
             dt = dt.view(-1, 1, 1)
 
         return state_in + dt * v_pred

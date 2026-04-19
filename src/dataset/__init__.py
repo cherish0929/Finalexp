@@ -8,7 +8,6 @@ Public API:
 """
 
 from src.dataset.dataset_fast import AeroGtoDataset
-from src.dataset.dataset_2d import AeroGtoDataset2D
 from src.dataset.dataset_cut_fast import CutAeroGtoDataset
 
-__all__ = ["AeroGtoDataset", "AeroGtoDataset2D", "CutAeroGtoDataset"]
+__all__ = ["AeroGtoDataset", "CutAeroGtoDataset"]

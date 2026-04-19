@@ -310,21 +310,21 @@ class MeltPoolResNet(_AutoregressiveMixin, nn.Module):
         x  = self.up1(x)                          # (bs, ch1, D/2, H/2, W/2)
         if x.shape != x1.shape:
             x = F.interpolate(x, size=x1.shape[2:], mode='trilinear', align_corners=False)
-        x  = self.proj1(torch.cat([x, x1], dim=1))
-        x  = self._run_blocks(x, self.dec1, cond)
+        x  = self._run_blocks(torch.cat([x, x1], dim=1), self.dec1, cond)
+        x  = self.proj1(x)
 
         x  = self.up0(x)                          # (bs, ch0, D, H, W)
         if x.shape != x0.shape:
             x = F.interpolate(x, size=x0.shape[2:], mode='trilinear', align_corners=False)
-        x  = self.proj0(torch.cat([x, x0], dim=1))
-        x  = self._run_blocks(x, self.dec0, cond)
+        x  = self._run_blocks(torch.cat([x, x0], dim=1), self.dec0, cond)
+        x  = self.proj0(x)
 
         # ── Output + Euler step ──
         v_pred = self._from_grid(self.outc(x))    # (bs, N, out_dim)
 
         if dt is None:
             dt = self.dt
-        elif dt.dim() == 1:
+        elif isinstance(dt, torch.Tensor) and dt.dim() == 1:
             dt = dt.view(-1, 1, 1)
 
         return state_in + dt * v_pred
@@ -464,7 +464,8 @@ class ConvLSTMModel(_AutoregressiveMixin, nn.Module):
         xg = self._to_grid(node_feat)                          # (bs, node_in, D, H, W)
 
         # Broadcast cond as an extra spatial channel
-        cond_map = cond.view(-1, 1, 1, 1, 1).expand(-1, 1, *xg.shape[2:])
+        cond_scalar = cond.mean(dim=1)                                    # (bs,)
+        cond_map = cond_scalar[:, None, None, None, None].expand(-1, 1, *xg.shape[2:])
         xg = torch.cat([xg, cond_map], dim=1)                  # (bs, node_in+1, D,H,W)
 
         # ── Encoder ──
@@ -490,7 +491,7 @@ class ConvLSTMModel(_AutoregressiveMixin, nn.Module):
 
         if dt is None:
             dt = self.dt
-        elif dt.dim() == 1:
+        elif isinstance(dt, torch.Tensor) and dt.dim() == 1:
             dt = dt.view(-1, 1, 1)
 
         return state_in + dt * v_pred
@@ -635,7 +636,7 @@ class ResNet3DModel(_AutoregressiveMixin, nn.Module):
 
         if dt is None:
             dt = self.dt
-        elif dt.dim() == 1:
+        elif isinstance(dt, torch.Tensor) and dt.dim() == 1:
             dt = dt.view(-1, 1, 1)
 
         return state_in + dt * v_pred

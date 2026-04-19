@@ -30,6 +30,7 @@ LPBF suitability
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 
@@ -129,14 +130,12 @@ class HeterogeneousNormAttention(nn.Module):
         attn = torch.softmax(attn, dim=-1)
         attn = self.drop(attn)
 
-        out = (attn @ V).transpose(1, 2).reshape(bs, Nq, d)           # (bs,Nq,d)
-
         # Apply geometric gate (per-head spatial modulation)
         gate = self.geo_gate(query)                                    # (bs,Nq,H,1)
-        out_gated = (attn @ V).transpose(1, 2)                         # (bs,Nq,H,hd)
-        out_gated = (out_gated * gate).reshape(bs, Nq, d)
+        out = (attn @ V).transpose(1, 2)                               # (bs,Nq,H,hd)
+        out = (out * gate).reshape(bs, Nq, d)
 
-        return self.out_proj(out_gated)
+        return self.out_proj(out)
 
 
 # ─── Mixture-of-Experts FFN ───────────────────────────────────────────────────
@@ -182,7 +181,11 @@ class GNOTBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, n_experts: int,
                  enc_s_dim: int, dropout: float = 0.0):
         super().__init__()
-        node_dim = d_model + enc_s_dim
+        raw_dim = d_model + enc_s_dim
+        # Pad to nearest multiple of n_heads so multi-head attention works
+        node_dim = ((raw_dim + n_heads - 1) // n_heads) * n_heads
+        self.node_dim = node_dim
+        self.raw_dim = raw_dim
 
         self.ln1  = nn.LayerNorm(node_dim)
         self.attn = HeterogeneousNormAttention(node_dim, n_heads, dropout)
@@ -194,6 +197,9 @@ class GNOTBlock(nn.Module):
 
     def forward(self, V: torch.Tensor, pos_enc: torch.Tensor) -> torch.Tensor:
         V_in = torch.cat([V, pos_enc], dim=-1)
+        pad = self.node_dim - self.raw_dim
+        if pad > 0:
+            V_in = F.pad(V_in, (0, pad))
         V_in = V_in + self.attn(self.ln1(V_in))
         V_in = V_in + self.moe(self.ln2(V_in))
         return V + self.proj_out(V_in)

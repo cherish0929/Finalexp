@@ -26,6 +26,7 @@ LPBF suitability
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 
@@ -134,7 +135,11 @@ class TransolverBlock(nn.Module):
         super().__init__()
 
         # node features are concat with spatial encoding inside the block
-        node_dim = d_model + enc_s_dim
+        raw_dim = d_model + enc_s_dim
+        # Pad to nearest multiple of n_heads so multi-head attention works
+        node_dim = ((raw_dim + n_heads - 1) // n_heads) * n_heads
+        self.node_dim = node_dim
+        self.raw_dim = raw_dim
 
         self.ln1  = nn.LayerNorm(node_dim)
         self.attn = PhysicsAttention(node_dim, n_heads, n_slices, dropout)
@@ -154,7 +159,10 @@ class TransolverBlock(nn.Module):
         pos_enc : (bs, N, enc_s_dim)   — Fourier-encoded node positions
         """
         # concatenate spatial encoding at each layer (mirrors PhysGTO's MixerBlock)
-        V_in = torch.cat([V, pos_enc], dim=-1)               # (bs,N,node_dim)
+        V_in = torch.cat([V, pos_enc], dim=-1)               # (bs,N,raw_dim)
+        pad = self.node_dim - self.raw_dim
+        if pad > 0:
+            V_in = F.pad(V_in, (0, pad))
         V_in = V_in + self.attn(self.ln1(V_in))
         V_in = V_in + self.ffn(self.ln2(V_in))
         return V + self.proj_out(V_in)                       # residual onto V
