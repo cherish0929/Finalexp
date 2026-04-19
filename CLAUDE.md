@@ -1,88 +1,96 @@
-# CLAUDE.md
+# LPBF 多物理场重构 — 对比实验工作区
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## 项目背景
 
-## Environment
+本项目基于算子学习范式对激光粉末床熔融（LPBF）过程中的多物理场（温度场、应力场、熔池形貌等）进行代理模型重构。核心贡献模型为 **PhysGTO-AttnRes-Multi**，在原版 PhysGTO 基础上引入了：
+- **Attention Residual**：增强特征提取的稳定性与深度；
+- **跨物理场 Cross-Attention**：显式建模不同物理场之间的耦合关系。
 
-All commands should be run inside the `GTO` conda environment:
-```bash
-conda activate GTO
+当前目录为**对比实验专用工作区**，目标是通过与业界主流模型的系统性比较，验证本方法在 LPBF 多物理场代理建模领域的先进性与创新性。
+
+---
+
+## 目录结构
+
+```
+.
+├── CLAUDE.md                         # 本文件（项目规范与任务说明）
+├── main_contrast.py                  # 对比实验主入口（待完善）
+├── evaluate_contrast.py              # 对比实验评估脚本（待完善）
+├── main_v2.py                        # 参考主文件（已有，勿修改）
+├── evaluate.py                       # 参考评估文件（已有，勿修改）
+└── src/
+    ├── model/
+    │   ├── physgto.py                # 原版 PhysGTO（基线之一）
+    │   └── physgto_attnres_multi_v3.py  # 本文核心模型（PhysGTO-AttnRes-Multi）
+    └── contrast/
+        ├── mgn_model.py              # MeshGraphNets
+        ├── transolver_model.py       # Transolver
+        ├── gnot_model.py             # GNOT
+        ├── baseline_models.py        # FNO3D / UNet3D / GraphViT
+        └── lpbf_baseline_models.py   # MeltPoolResNet / ConvLSTMModel / ResNet3DModel
 ```
 
-## Training
+---
 
-Training is fully config-driven. Use `main_v2.py` (preferred — includes warmup LR, pushforward training, EMA) or `main.py` (legacy):
+## 对比模型清单
 
-```bash
-python main_v2.py --config config/easypool/GTO_easypool_stronger.json
-python main_v2.py --config config/keyhole/GTO_keyhole_stronger.json
-```
+### A. 通用 PDE 代理模型（7 个）
 
-See `easypool.sh` and `keyhole.sh` for example experiment commands.
-
-## Evaluation & Inference
-
-```bash
-# Evaluate multiple trained models on test sets (edit CONFIG_LIST inside evaluate.py first)
-python evaluate.py
-
-# Inference with visualization (saves VTK files and plots)
-python inference.py       # standard
-python inference_v1.py    # variant with additional options
-python inference_cut.py   # for cut-domain datasets
-python inference_air.py   # for air-field specific inference
-```
-
-## Config System
-
-All hyperparameters live in JSON files under `config/`. The `src/utils.py:load_json_config()` function loads them as a `SimpleNamespace` for dot-access. Key config sections:
-
-- `data.fields`: list of physical fields to predict, e.g. `["T", "alpha.air"]`
-- `data.horizon_train` / `data.horizon_test`: autoregressive rollout steps
-- `data.cut`: if `true`, uses `CutAeroGtoDataset` (spatial sub-domain cropping)
-- `model.name`: selects which model class to instantiate (see architecture section)
-- `model.load_path`: directory to resume from (`{name}_best.pt` is loaded)
-- `train.weight_loss`: configures weighted / focal loss per field and optional gradient loss
-- `train.pushforward`: enables pushforward training (extra rollout steps during training)
-
-## Architecture
-
-**PhysGTO** is a graph-based neural operator for time-series PDE simulation (additive manufacturing / fluid dynamics).
-
-The forward pass is autoregressive: given initial state `x_0`, the model rolls out `T` steps predicting `[x_1, ..., x_T]`.
-
-### Core model components (`src/physgto.py` and variants)
-- **Encoder**: embeds `(node_pos, state, time, conditions) → (V, E)`. Node features combine state + positional Fourier embeddings + time encoding + condition encoding. Edge features encode relative displacement + distance.
-- **Mixer** (`N_block` stacked `MixerBlock`s): each block runs GNN message-passing → cross-attention (`Atten` module with learnable queries) → FFN with residual connections.
-- **Atten**: 3-step attention — cross-attend from learnable token queries to node features, self-attend tokens, cross-attend back to nodes.
-- **Decoder**: concatenates all block outputs (`[B, N_block, N, enc_dim]`), projects through MLP to predict `delta_state`.
-
-### Model variants (selected by `model.name` in config)
-| Config name | Module | Description |
+| 模型 | 文件 | 类型 |
 |---|---|---|
-| `PhysGTO` | `src/physgto.py` | Base GTO model |
-| `gto_res` | `src/physgto_res.py` | With residual connections |
-| `gto_attnres_multi` | `src/physgto_attnres_multi.py` | Multi-field attention residual |
-| `gto_attnres_multi_v2` | `src/physgto_attnres_multi_v2.py` | v2 with `attn_res_mode` |
-| `gto_res_attnres` | `src/physgto_res_attnres.py` | Combined residual + attention residual |
-| `v3` | `src/gto_res_attnres_v3_self.py` | Latest self-attention variant |
-| `gto_lnn` | `src/gto_lnn.py` | Lagrangian neural network variant |
+| PhysGTO | `src/model/physgto.py` | 图-Transformer 混合 |
+| MeshGraphNets (MGN) | `src/contrast/mgn_model.py` | 图神经网络 |
+| Transolver | `src/contrast/transolver_model.py` | Transformer |
+| GNOT | `src/contrast/gnot_model.py` | 图神经算子 |
+| FNO3D | `src/contrast/baseline_models.py` | 傅里叶神经算子 |
+| UNet3D | `src/contrast/baseline_models.py` | 卷积编解码器 |
+| GraphViT | `src/contrast/baseline_models.py` | 图-ViT 混合 |
 
-### Dataset classes (`src/dataset*.py`)
-- `AeroGtoDataset` / `dataset_fast.py`: 3D mesh data, standard loader with metadata caching
-- `AeroGtoDataset2D` / `dataset_2d.py`: 2D version
-- `CutAeroGtoDataset` / `dataset_cut_fast.py`: spatially cropped sub-domain sampling
+### B. LPBF 专用代理模型（3 个）
 
-Datasets read file lists from `.txt` files (e.g. `data/train_new_easypool-1.txt`). Normalization statistics are cached to `norm_cache.json`.
+| 模型 | 文件 | 来源背景 |
+|---|---|---|
+| MeltPoolResNet | `src/contrast/lpbf_baseline_models.py` | 熔池形貌预测 |
+| ConvLSTMModel | `src/contrast/lpbf_baseline_models.py` | 时序热场预测 |
+| ResNet3DModel | `src/contrast/lpbf_baseline_models.py` | 3D 残差结构 |
 
-### Training loss (`src/train.py`)
-- **Value loss**: MSE by default; weighted focal MSE or Huber loss for VOF fields (`alpha.*`, `gamma.*`) when `weight_loss.enable = true`
-- **Gradient loss**: optional 3D finite-difference spatial gradient loss (requires `weight_loss.gradient = true` and `grid_shape`)
-- **Region metrics**: active/inactive region L2/RMSE tracked separately when `data.active_mask` is configured
-- AMP (mixed precision) controlled via `train.use_amp`; gradient checkpointing via `train.check_point`
+> **我们的方法**：`PhysGTO-AttnRes-Multi`（`src/model/physgto_attnres_multi_v3.py`）
 
-### Output structure
-Saved under `save_path/` (configured per experiment):
-- `nn/`: model checkpoints (`{name}_best.pt`, `{name}_{epoch}.pt`)
-- `logs/`: TensorBoard event files
-- `record/`: text training logs (`{name}_training_log.txt`)
+---
+
+## 主要任务
+
+### Task 1 — 模型适配性检查（`src/contrast/` & `src/model/physgto.py`）
+
+逐一检查上述 10 个对比模型，确保：
+
+1. **前向传播和自回归流程一致**：自回归推理逻辑（时间步展开方式、隐状态传递）须与 PhysGTO 的实现对齐；
+2. **特殊输入兼容**：若某模型需要额外输入（如邻接矩阵、网格坐标、边特征），在 `main_contrast.py` 中单独构造，不改动模型本身；
+3. **无静默错误**：确保维度匹配，避免 shape 静默广播掩盖问题。
+
+### Task 2 — 主文件 `main_contrast.py`
+
+以 `main_v2.py` 为模板，扩展支持所有 10 个对比模型 + 本文模型，要求：
+
+- 通过配置文件控制调用模型（参考`config/template.json`，可以为每个模型打造特定的配置文件）
+- 为需要特殊输入的模型（MGN、GNOT 等图模型）添加专属的数据预处理分支（必要的时候可以修改数据集文件`src/dataset/dataset_fast.py`，但不能影响已有模型的正常使用）；
+- 训练、验证、测试流程与 `main_v2.py` 保持一致；
+
+### Task 3 — 评估脚本 `evaluate_contrast.py`
+
+以 `evaluate.py` 为模板，在原有精度指标基础上，增加**推理效率统计**：
+
+| 新增指标 | 说明 |
+|---|---|
+| 平均推理时间（ms/sample） | 含 warm-up，取多次均值 |
+| GPU 显存峰值（MB） | `torch.cuda.max_memory_allocated()` |
+| 模型参数量（M） | `sum(p.numel() for p in model.parameters())` |
+| FLOPs（GFLOPs） | 使用 `fvcore` 或 `ptflops` 估算 |
+
+---
+
+## 注意事项
+
+> 在开始任何修改之前，请先完整阅读 `main_v2.py` 和 `evaluate.py`，以理解现有的数据流、接口约定、训练循环结构以及编码规范，再进行扩展，**不要重写已有逻辑**；
+> 修改或新建的代码需要做好注释和签名。
