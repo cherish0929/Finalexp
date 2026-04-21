@@ -29,7 +29,7 @@ from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
 
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, Sampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
@@ -634,6 +634,87 @@ def _worker_init_fn(worker_id, base_seed):
     torch.manual_seed(seed)
 
 
+def _resolve_dataset_for_grouping(ds):
+    """剥离 Subset，返回 (base_dataset, parent_index_map)。
+    parent_index_map[i] = base_dataset 中对应原始下标。"""
+    if isinstance(ds, Subset):
+        base, idx_map = _resolve_dataset_for_grouping(ds.dataset)
+        mapped = [idx_map[i] for i in ds.indices]
+        return base, mapped
+    return ds, list(range(len(ds)))
+
+
+def _sample_node_count(base_dataset, sample_idx: int) -> int:
+    """O(1) 取样本节点数：直接从 meta_cache 中查询，避免触发 __getitem__。"""
+    file_id, _ = base_dataset.sample_keys[sample_idx]
+    path = base_dataset.file_paths[file_id]
+    return base_dataset.meta_cache[path]["node_pos"].shape[0]
+
+
+class GridGroupedBatchSampler(Sampler):
+    """按节点数（grid 形状）分组的 BatchSampler。
+
+    Why: easypool 数据集中不同 HDF5 文件的网格形状不同，导致样本节点数不一致，
+    PyTorch 默认 collate 在 batchsize>1 时无法 stack 变长 tensor。
+    本采样器保证同一 batch 内的样本节点数一致，从而绕过 collate 的 stack 限制，
+    且不引入 padding（不会污染 loss / 指标）。
+
+    drop_last=False 时若某组余样本数 < batch_size，会形成一个小 batch（与默认行为一致）。
+    """
+
+    def __init__(self, dataset, batch_size: int, shuffle: bool, seed=None, drop_last: bool = False):
+        self.dataset = dataset
+        self.batch_size = max(1, int(batch_size))
+        self.shuffle = bool(shuffle)
+        self.seed = seed
+        self.drop_last = bool(drop_last)
+
+        base, idx_map = _resolve_dataset_for_grouping(dataset)
+        # 按节点数分组：{node_num: [dataloader 用的下标列表]}
+        groups: dict = {}
+        for i, parent_idx in enumerate(idx_map):
+            n = _sample_node_count(base, parent_idx)
+            groups.setdefault(n, []).append(i)
+        self._groups = groups
+        self._epoch = 0
+
+    def _build_batches(self):
+        rng = np.random.default_rng(
+            None if self.seed is None else self.seed + self._epoch
+        )
+        batches = []
+        for _, idx_list in self._groups.items():
+            order = list(idx_list)
+            if self.shuffle:
+                order = list(rng.permutation(order))
+            for s in range(0, len(order), self.batch_size):
+                chunk = order[s:s + self.batch_size]
+                if self.drop_last and len(chunk) < self.batch_size:
+                    continue
+                batches.append(chunk)
+        if self.shuffle:
+            perm = rng.permutation(len(batches))
+            batches = [batches[i] for i in perm]
+        return batches
+
+    def __iter__(self):
+        batches = self._build_batches()
+        self._epoch += 1
+        for b in batches:
+            yield b
+
+    def __len__(self):
+        # 不依赖 epoch 状态：用一次稳定的计算
+        total = 0
+        for idx_list in self._groups.values():
+            n = len(idx_list)
+            if self.drop_last:
+                total += n // self.batch_size
+            else:
+                total += (n + self.batch_size - 1) // self.batch_size
+        return total
+
+
 def get_dataloader(args, path_record, device_type, pf_extra_max=0):
     """
     创建训练/测试 DataLoader。
@@ -687,17 +768,27 @@ def get_dataloader(args, path_record, device_type, pf_extra_max=0):
 
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=data_cfg['train'].get("batchsize", 1),
-        shuffle=True,
+        batch_sampler=GridGroupedBatchSampler(
+            train_dataset,
+            batch_size=data_cfg['train'].get("batchsize", 1),
+            shuffle=True,
+            seed=seed,
+            drop_last=False,
+        ),
         num_workers=data_cfg['train'].get("num_workers", 0),
         pin_memory=pin_memory,
-        **dl_kwargs,
+        worker_init_fn=dl_kwargs.get("worker_init_fn"),
     )
 
     test_dataloader = DataLoader(
         test_dataset,
-        batch_size=data_cfg['test'].get("batchsize", 1),
-        shuffle=False,
+        batch_sampler=GridGroupedBatchSampler(
+            test_dataset,
+            batch_size=data_cfg['test'].get("batchsize", 1),
+            shuffle=False,
+            seed=seed,
+            drop_last=False,
+        ),
         num_workers=data_cfg['test'].get("num_workers", 0),
         pin_memory=pin_memory,
     )
