@@ -707,7 +707,8 @@ def get_dataloader(args, path_record, device_type, pf_extra_max=0):
 
     # 从数据集获取 grid_shape（所有样本应该相同）
     sample_batch = next(iter(train_dataloader))
-    grid_shape = tuple(sample_batch["grid_shape"].tolist())
+    grid_shape = tuple(sample_batch["grid_shape"].tolist()[0])
+    print(grid_shape)
 
     with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
         file.write(f"No. of train samples: {len(train_dataset)}, No. of test samples: {len(test_dataset)}\n")

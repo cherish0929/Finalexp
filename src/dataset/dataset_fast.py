@@ -273,8 +273,16 @@ class AeroGtoDataset(Dataset):
         self.time_ref = 2e-5 if self.config.get("dt_scale", False) else 1
         self.edge_sample_ratio = self.config.get("edge_sample_ratio", 1.0)
 
-        for file_id, path in enumerate(self.file_paths):
-            meta = self._build_meta(path)
+        valid_paths = []
+        for path in self.file_paths:
+            try:
+                meta = self._build_meta(path)
+            except OSError as e:
+                print(f"[WARNING] 跳过损坏的 HDF5 文件: {path}\n  原因: {e}")
+                continue
+
+            file_id = len(valid_paths)
+            valid_paths.append(path)
             self.meta_cache[path] = meta
             self.max_start_per_file.append(meta["max_start"])
 
@@ -285,6 +293,14 @@ class AeroGtoDataset(Dataset):
                 step = max(1, self.horizon // 2)
                 for start in range(1, meta["max_start"] + 1, step):
                     self.sample_keys.append((file_id, start))
+
+        skipped = len(self.file_paths) - len(valid_paths)
+        self.file_paths = valid_paths
+        if skipped > 0:
+            print(f"[WARNING] 共跳过 {skipped} 个损坏文件，"
+                  f"有效文件 {len(valid_paths)}/{len(valid_paths) + skipped}")
+        if len(valid_paths) == 0:
+            raise RuntimeError("所有 HDF5 文件均损坏，无法创建数据集")
 
         example_meta = next(iter(self.meta_cache.values()))
         self.cond_dim = example_meta["conditions"].shape[-1]
@@ -432,9 +448,11 @@ class AeroGtoDataset(Dataset):
     def __len__(self):
         return len(self.sample_keys)
 
-    def _load_window(self, path: str, indices: np.ndarray, start: int):
+    def _load_window(self, path: str, indices: np.ndarray, start: int, stride:int = None):
+        if stride is None:
+            stride = self.time_stride
         with h5py.File(path, "r") as f:
-            time_idx = start + np.arange(0, self.horizon + self.pf_extra + 1) * self.time_stride
+            time_idx = start + np.arange(0, self.horizon + self.pf_extra + 1) * stride
             channels = []
             for fname in self.fields:
                 fkey = f"state/{fname}"
@@ -450,10 +468,14 @@ class AeroGtoDataset(Dataset):
         path = self.file_paths[file_id]
         meta = self.meta_cache[path]
 
+        ori_dt, dt, stride = meta["dt"], meta["dt"], 1
+        while dt + ori_dt <= 3e-6 and stride < self.time_stride:
+            stride += 1; dt += ori_dt
+
         if start_idx is None:
             start_idx = random.randint(1, meta["max_start"])
 
-        state_np, time_seq = self._load_window(path, meta["indices"], start_idx)
+        state_np, time_seq = self._load_window(path, meta["indices"], start_idx, stride)
         state = torch.from_numpy(state_np)  # [T, N, C]
 
         liquid_cut = self.config.get("liquid_cut", False)
@@ -477,7 +499,7 @@ class AeroGtoDataset(Dataset):
         time_tensor = torch.from_numpy(rel_time.astype(np.float32)).unsqueeze(-1)
 
         sample = {
-            "dt":         meta['dt'] * self.time_stride / self.time_ref,
+            "dt":         meta['dt'] * stride / self.time_ref,
             "state":      state,
             "time_seq":   time_tensor / self.time_ref,
             "node_pos":   node_pos,
