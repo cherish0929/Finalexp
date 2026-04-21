@@ -49,9 +49,12 @@ def FourierEmbedding(pos, pos_start, pos_length):
 
 
 def get_edge_info(edges, node_pos):
-    """Compute relative displacement vectors for each edge."""
-    idx0 = edges[..., 0:1].expand(-1, -1, node_pos.shape[-1])
-    idx1 = edges[..., 1:2].expand(-1, -1, node_pos.shape[-1])
+    """Compute relative displacement vectors for each edge.
+    Handles -1 padding by clamping to [0, N-1]; callers zero-out padded rows."""
+    N = node_pos.shape[-2]
+    safe = edges.clamp(min=0, max=N - 1)
+    idx0 = safe[..., 0:1].expand(-1, -1, node_pos.shape[-1])
+    idx1 = safe[..., 1:2].expand(-1, -1, node_pos.shape[-1])
     s = torch.gather(node_pos, -2, idx0)
     r = torch.gather(node_pos, -2, idx1)
     d = r - s
@@ -162,21 +165,26 @@ class _GNNBlock(nn.Module):
 
     def forward(self, V, E, edges):
         bs, N, nd = V.shape
-        ne = edges.shape[1]
         ed = E.shape[-1]
 
+        # valid_mask: (bs, ne) — False for -1-padded rows
+        valid_mask = (edges >= 0).all(-1)  # (bs, ne)
+
+        safe = edges.clamp(min=0, max=N - 1)
+
         # Gather sender / receiver features
-        s_idx = edges[..., 0:1].expand(-1, -1, nd)
-        r_idx = edges[..., 1:2].expand(-1, -1, nd)
+        s_idx = safe[..., 0:1].expand(-1, -1, nd)
+        r_idx = safe[..., 1:2].expand(-1, -1, nd)
         S = torch.gather(V, 1, s_idx)
         R = torch.gather(V, 1, r_idx)
 
-        # Edge update
+        # Edge update — zero-out padded rows so they don't corrupt scatter
         e_new = self.f_edge(torch.cat([S, R, E], dim=-1))  # (bs,ne,ed)
+        e_new = e_new * valid_mask.unsqueeze(-1)
 
-        # Aggregate to receiver nodes (scatter mean)
-        recv_idx = edges[..., 1:2].expand(-1, -1, ed)
-        agg = scatter_mean(e_new, recv_idx, dim=1, dim_size=N)  # (bs,N,ed)
+        # Aggregate to receiver nodes (scatter mean over valid edges only)
+        recv_idx = safe[..., 1:2].expand(-1, -1, ed)
+        agg = scatter_mean(e_new * valid_mask.unsqueeze(-1), recv_idx, dim=1, dim_size=N)  # (bs,N,ed)
 
         # Node update (residual)
         v_new = self.f_node(torch.cat([V, agg], dim=-1))

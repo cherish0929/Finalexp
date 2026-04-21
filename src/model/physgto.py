@@ -7,10 +7,14 @@ from torch.utils.checkpoint import checkpoint
 from torch.amp import GradScaler, autocast
 
 def get_edge_info(edges, node_pos):
-    senders = torch.gather(node_pos, -2, edges[..., 0].unsqueeze(-1).expand(-1, -1, node_pos.shape[-1]))
-    receivers = torch.gather(node_pos, -2, edges[..., 1].unsqueeze(-1).expand(-1, -1, node_pos.shape[-1]))
+    """Compute [d, -d, ‖d‖] edge features. Handles -1 padding by clamping
+    indices to [0, N-1]; callers are responsible for zeroing-out padded rows."""
+    N = node_pos.shape[-2]
+    safe = edges.clamp(min=0, max=N - 1)
+    senders   = torch.gather(node_pos, -2, safe[..., 0].unsqueeze(-1).expand(-1, -1, node_pos.shape[-1]))
+    receivers = torch.gather(node_pos, -2, safe[..., 1].unsqueeze(-1).expand(-1, -1, node_pos.shape[-1]))
     d = receivers - senders
-    norm = torch.sqrt((d ** 2).sum(-1, keepdims=True))
+    norm = torch.sqrt((d ** 2).sum(-1, keepdims=True) + 1e-8)
     # distance_2 = -distance_1
     E = torch.cat([d, -d, norm], dim=-1)
     return E
@@ -68,10 +72,10 @@ class Atten(nn.Module):
         self.attention2 = nn.MultiheadAttention(embed_dim=self.c_dim, num_heads=self.n_heads, batch_first=True)
         self.attention3 = nn.MultiheadAttention(embed_dim=self.c_dim, num_heads=self.n_heads, batch_first=True)
 
-    def forward(self, W0):   
+    def forward(self, W0):
         # Step 1: Initial attention with learned query
         batch = W0.shape[0]
-        learned_Q = self.Q.unsqueeze(0).repeat(batch, 1, 1)
+        learned_Q = self.Q.unsqueeze(0).expand(batch, -1, -1)
         W, _ = self.attention1(learned_Q, W0, W0)
     
         # Step 2: Self-attention on the transformed result
@@ -126,10 +130,11 @@ class GNN(nn.Module):
         )
 
     def get_edges_info(self, V, E, edges):
-        # edges: (bs, ne, 2)
-        # gather indices shape: (bs, ne, feat)
-        senders = torch.gather(V, -2, edges[..., 0].unsqueeze(-1).expand(-1, -1, V.shape[-1]))
-        receivers = torch.gather(V, -2, edges[..., 1].unsqueeze(-1).expand(-1, -1, V.shape[-1]))
+        # edges: (bs, ne, 2); may contain -1 padding rows
+        N = V.shape[-2]
+        safe = edges.clamp(min=0, max=N - 1)
+        senders   = torch.gather(V, -2, safe[..., 0].unsqueeze(-1).expand(-1, -1, V.shape[-1]))
+        receivers = torch.gather(V, -2, safe[..., 1].unsqueeze(-1).expand(-1, -1, V.shape[-1]))
         edge_inpt = torch.cat([senders, receivers, E], dim=-1)
         return edge_inpt
 
@@ -137,24 +142,30 @@ class GNN(nn.Module):
         """
         V: (bs, N, node_size)
         E: (bs, ne, edge_size)
-        edges: (bs, ne, 2) long
-        idx0/idx1: (bs, ne) flattened indices (optional, fast path)
+        edges: (bs, ne, 2) long — may contain -1 padding rows
         """
         bs, N, _ = V.shape
+
+        # valid_mask: (bs, ne) — False for -1-padded rows
+        valid_mask = (edges >= 0).all(-1)  # (bs, ne)
+
         edge_inpt = self.get_edges_info(V, E, edges)
         edge_embeddings = self.f_edge(edge_inpt)
 
-        # keep your original semantics: split into two directed parts
+        # Zero-out padded edge embeddings so they don't corrupt scatter
+        edge_embeddings = edge_embeddings * valid_mask.unsqueeze(-1)
+
         edge_embeddings_0, edge_embeddings_1 = edge_embeddings.chunk(2, dim=-1)
 
         feat0 = edge_embeddings_0.shape[-1]
         feat1 = edge_embeddings_1.shape[-1]
 
-        # IMPORTANT: expand instead of repeat (no real copy)
-        col_0 = edges[..., 0].unsqueeze(-1).expand(-1, -1, feat0)
-        col_1 = edges[..., 1].unsqueeze(-1).expand(-1, -1, feat1)
+        # Clamp to safe indices for scatter (padded rows → scatter to node 0,
+        # but their zero embeddings contribute nothing meaningful)
+        safe = edges.clamp(min=0, max=N - 1)
+        col_0 = safe[..., 0].unsqueeze(-1).expand(-1, -1, feat0)
+        col_1 = safe[..., 1].unsqueeze(-1).expand(-1, -1, feat1)
 
-        # nodes axis is dim=1 (same as your -2)
         edge_mean_0 = scatter_mean(edge_embeddings_0, col_0, dim=1, dim_size=N)
         edge_mean_1 = scatter_mean(edge_embeddings_1, col_1, dim=1, dim_size=N)
 

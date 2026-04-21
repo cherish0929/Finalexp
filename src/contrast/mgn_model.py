@@ -45,11 +45,12 @@ def FourierEmbedding(pos, pos_start, pos_length):
 
 
 def get_edge_info(edges, node_pos):
-    """Compute [d, -d, ‖d‖] edge features from node positions."""
-    s = torch.gather(node_pos, -2,
-                     edges[..., 0:1].expand(-1, -1, node_pos.shape[-1]))
-    r = torch.gather(node_pos, -2,
-                     edges[..., 1:2].expand(-1, -1, node_pos.shape[-1]))
+    """Compute [d, -d, ‖d‖] edge features from node positions.
+    Handles -1 padding by clamping to [0, N-1]; callers zero-out padded rows."""
+    N = node_pos.shape[-2]
+    safe = edges.clamp(min=0, max=N - 1)
+    s = torch.gather(node_pos, -2, safe[..., 0:1].expand(-1, -1, node_pos.shape[-1]))
+    r = torch.gather(node_pos, -2, safe[..., 1:2].expand(-1, -1, node_pos.shape[-1]))
     d    = r - s
     norm = d.norm(dim=-1, keepdim=True)
     return torch.cat([d, -d, norm], dim=-1)            # (bs, ne, 2·space+1)
@@ -80,17 +81,22 @@ class MGNBlock(nn.Module):
 
     def forward(self, V, E, edges):
         bs, N, _ = V.shape
-        idx_expand = lambda col, d: edges[..., col:col+1].expand(-1, -1, d)
 
-        v_s = torch.gather(V, 1, idx_expand(0, V.shape[-1]))   # sender features
-        v_r = torch.gather(V, 1, idx_expand(1, V.shape[-1]))   # receiver features
+        # valid_mask: (bs, ne) — False for -1-padded rows
+        valid_mask = (edges >= 0).all(-1)  # (bs, ne)
+
+        safe = edges.clamp(min=0, max=N - 1)
+        v_s = torch.gather(V, 1, safe[..., 0:1].expand(-1, -1, V.shape[-1]))   # sender features
+        v_r = torch.gather(V, 1, safe[..., 1:2].expand(-1, -1, V.shape[-1]))   # receiver features
 
         e_delta = self.f_edge(torch.cat([v_s, v_r, E], dim=-1))
-        E = E + e_delta                                          # edge residual
+        e_delta = e_delta * valid_mask.unsqueeze(-1)    # zero-out padded rows
+        E = E + e_delta                                  # edge residual
 
-        agg = scatter_mean(E, idx_expand(1, E.shape[-1]), dim=1, dim_size=N)
+        recv_idx = safe[..., 1:2].expand(-1, -1, E.shape[-1])
+        agg = scatter_mean(E * valid_mask.unsqueeze(-1), recv_idx, dim=1, dim_size=N)
         v_delta = self.f_node(torch.cat([V, agg], dim=-1))
-        V = V + v_delta                                          # node residual
+        V = V + v_delta                                  # node residual
         return V, E
 
 

@@ -43,8 +43,12 @@ from torch.utils.checkpoint import checkpoint
 # =============================================================================
 
 def get_edge_info(edges, node_pos):
-    senders = torch.gather(node_pos, -2, edges[..., 0].unsqueeze(-1).expand(-1, -1, node_pos.shape[-1]))
-    receivers = torch.gather(node_pos, -2, edges[..., 1].unsqueeze(-1).expand(-1, -1, node_pos.shape[-1]))
+    """Compute [d, -d, ‖d‖] edge features. Handles -1 padding by clamping
+    indices to [0, N-1]; callers are responsible for zeroing-out padded rows."""
+    N = node_pos.shape[-2]
+    safe = edges.clamp(min=0, max=N - 1)
+    senders   = torch.gather(node_pos, -2, safe[..., 0].unsqueeze(-1).expand(-1, -1, node_pos.shape[-1]))
+    receivers = torch.gather(node_pos, -2, safe[..., 1].unsqueeze(-1).expand(-1, -1, node_pos.shape[-1]))
     d = receivers - senders
     norm = torch.sqrt((d ** 2).sum(-1, keepdims=True) + 1e-8)
     E = torch.cat([d, -d, norm], dim=-1)
@@ -248,39 +252,48 @@ class GNN(nn.Module):
 
     def forward(self, V, E, edges):
         bs, N, _ = V.shape
-        senders = torch.gather(V, -2, edges[..., 0].unsqueeze(-1).expand(-1, -1, V.shape[-1]))
-        receivers = torch.gather(V, -2, edges[..., 1].unsqueeze(-1).expand(-1, -1, V.shape[-1]))
+
+        # valid_mask: (bs, ne) — False for -1-padded rows
+        valid_mask = (edges >= 0).all(-1)  # (bs, ne)
+
+        safe = edges.clamp(min=0, max=N - 1)
+        senders   = torch.gather(V, -2, safe[..., 0].unsqueeze(-1).expand(-1, -1, V.shape[-1]))
+        receivers = torch.gather(V, -2, safe[..., 1].unsqueeze(-1).expand(-1, -1, V.shape[-1]))
         edge_inpt = torch.cat([senders, receivers, E], dim=-1)
         edge_embeddings = self.f_edge(edge_inpt)
 
+        # Zero-out padded edge embeddings so they don't corrupt scatter
+        edge_embeddings = edge_embeddings * valid_mask.unsqueeze(-1)
+
         # 显式双头消息
-        msg_sender = self.f_msg_sender(edge_embeddings)
+        msg_sender   = self.f_msg_sender(edge_embeddings)
         msg_receiver = self.f_msg_receiver(edge_embeddings)
 
         # 注意力加权聚合
-        logit_sender = self.f_attn_sender(edge_embeddings).squeeze(-1)     # (bs, ne)
-        logit_receiver = self.f_attn_receiver(edge_embeddings).squeeze(-1) # (bs, ne)
+        logit_sender   = self.f_attn_sender(edge_embeddings).squeeze(-1)     # (bs, ne)
+        logit_receiver = self.f_attn_receiver(edge_embeddings).squeeze(-1)   # (bs, ne)
 
-        # Clamp logits 防止 softmax 溢出
-        logit_sender = logit_sender.clamp(-30, 30)
-        logit_receiver = logit_receiver.clamp(-30, 30)
+        # Clamp logits; set padded rows to -inf so they don't affect scatter_softmax
+        PAD_LOGIT = -1e9
+        logit_sender   = logit_sender.clamp(-30, 30).masked_fill(~valid_mask, PAD_LOGIT)
+        logit_receiver = logit_receiver.clamp(-30, 30).masked_fill(~valid_mask, PAD_LOGIT)
 
         feat0, feat1 = msg_sender.shape[-1], msg_receiver.shape[-1]
 
-        col_0 = edges[..., 0].unsqueeze(-1).expand(-1, -1, feat0)
-        col_1 = edges[..., 1].unsqueeze(-1).expand(-1, -1, feat1)
-        col_0_scalar = edges[..., 0]  # (bs, ne)
-        col_1_scalar = edges[..., 1]  # (bs, ne)
+        col_0_scalar = safe[..., 0]   # (bs, ne)
+        col_1_scalar = safe[..., 1]   # (bs, ne)
+        col_0 = col_0_scalar.unsqueeze(-1).expand(-1, -1, feat0)
+        col_1 = col_1_scalar.unsqueeze(-1).expand(-1, -1, feat1)
 
         # Per-node softmax attention weights
-        alpha_0 = scatter_softmax(logit_sender, col_0_scalar, dim=1)    # (bs, ne)
-        alpha_1 = scatter_softmax(logit_receiver, col_1_scalar, dim=1)  # (bs, ne)
+        alpha_0 = scatter_softmax(logit_sender,   col_0_scalar, dim=1)   # (bs, ne)
+        alpha_1 = scatter_softmax(logit_receiver, col_1_scalar, dim=1)   # (bs, ne)
 
         # Weighted aggregation
-        edge_agg_0 = scatter_add(alpha_0.unsqueeze(-1) * msg_sender, col_0, dim=1, dim_size=N)
+        edge_agg_0 = scatter_add(alpha_0.unsqueeze(-1) * msg_sender,   col_0, dim=1, dim_size=N)
         edge_agg_1 = scatter_add(alpha_1.unsqueeze(-1) * msg_receiver, col_1, dim=1, dim_size=N)
 
-        edge_agg = torch.cat([edge_agg_0, edge_agg_1], dim=-1)
+        edge_agg  = torch.cat([edge_agg_0, edge_agg_1], dim=-1)
         node_inpt = torch.cat([V, edge_agg], dim=-1)
         node_embeddings = self.f_node(node_inpt)
 

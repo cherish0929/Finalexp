@@ -363,13 +363,14 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
         avg_loss = agg["loss"] / agg["num"]
         pbar.set_postfix({"Loss": f"{avg_loss:.4e}"})
 
-    from src.train import _REGION_PREFIXES, _REGION_MEANS
+    from src.train import _REGION_PREFIXES, _REGION_MEANS, _finalize_rmse
     for key, value in agg.items():
         if key != "each_l2" and key != "num" and not key.endswith("_cnt"):
             if key not in ("active_loss", "inactive_loss") and key not in _REGION_MEANS and not any(key.startswith(p + "_") for p in _REGION_PREFIXES):
                 agg[key] = value / agg["num"]
 
     agg["each_l2"] = (agg["each_l2"] / agg["num"]).cpu()
+    _finalize_rmse(agg, fields)
     if has_region:
         _finalize_region(agg, fields, agg["num"], include_loss=True)
     return agg
@@ -528,7 +529,7 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
         avg_loss = agg["loss"] / agg["num"]
         pbar.set_postfix({"Loss": f"{avg_loss:.4e}"})
 
-    from src.train import _REGION_PREFIXES, _REGION_MEANS
+    from src.train import _REGION_PREFIXES, _REGION_MEANS, _finalize_rmse
     if agg["num"] == 0:
         raise RuntimeError(
             "train_v2: all batches were skipped (NaN/spike guard triggered every batch). "
@@ -540,6 +541,7 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
                 agg[key] = value / agg["num"]
 
     agg["each_l2"] = (agg["each_l2"] / agg["num"]).cpu()
+    _finalize_rmse(agg, fields)
     if has_region:
         _finalize_region(agg, fields, agg["num"], include_loss=True)
     return agg

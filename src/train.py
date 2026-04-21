@@ -29,9 +29,10 @@ def _each_l2(pred, target):
 
 # rmse 同样需要反归一化数据
 def _rmse(pred, target):
+    """Returns per-channel MSE (not RMSE) so callers can accumulate correctly
+    across batches before taking sqrt at finalization."""
     diff = pred - target
-    mse = torch.mean(diff**2, dim=[0, 1, 2])
-    return torch.sqrt(mse)
+    return torch.mean(diff**2, dim=[0, 1, 2])
 
 # ---- Region-masked metric helpers ----
 
@@ -90,24 +91,34 @@ def compute_spatial_gradient_3d(tensor_field, grid_shape):
     """
     计算 3D 空间梯度 (一阶有限差分)
     :param tensor_field: 形状为 [B, T, N, 1] 的展平张量
-    :param grid_shape: (Nx, Ny, Nz) 三维网格尺寸
+    :param grid_shape: numpy array of shape [B, 3] — 每个样本的 (Nx, Ny, Nz)
+                       同一 batch 内所有样本必须共享相同的 grid shape
     :return: 沿 x, y, z 三个维度的梯度张量
     """
     B, T, N, C = tensor_field.shape
 
+    # Validate all samples in the batch share the same grid shape
+    if grid_shape.shape[0] > 1 and not (grid_shape == grid_shape[0]).all():
+        raise ValueError(
+            f"compute_spatial_gradient_3d: batch contains samples with different grid shapes "
+            f"{grid_shape.tolist()}. Gradient loss requires all samples in a batch to share "
+            f"the same grid shape. Use per-sample batching or ensure uniform grid_shape."
+        )
     Nx, Ny, Nz = int(grid_shape[0][0]), int(grid_shape[0][1]), int(grid_shape[0][2])
-    
+
     # 确保网格尺寸和展平尺寸匹配
-    assert Nx * Ny * Nz == N, f"网格尺寸 {grid_shape} 与节点数 {N} 不匹配！"
-    
-    # 1. 还原为 3D 网格形状: [B, Nx, Ny, Nz, C]
+    assert Nx * Ny * Nz == N, (
+        f"网格尺寸 {grid_shape[0].tolist()} 与节点数 {N} 不匹配！"
+    )
+
+    # 1. 还原为 3D 网格形状: [B, T, Nz, Ny, Nx, C]
     grid_field = tensor_field.view(B, T, Nz, Ny, Nx, C)
-    
+
     # 2. 沿三个空间维度计算一阶差分
     grad_x = grid_field[:, :, :, :, 1:, :] - grid_field[:, :, :, :, :-1, :]
     grad_y = grid_field[:, :, :, 1:, :, :] - grid_field[:, :, :, :-1, :, :]
     grad_z = grid_field[:, :, 1:, :, :, :] - grid_field[:, :, :-1, :, :, :]
-    
+
     return grad_x, grad_y, grad_z
 
 
@@ -189,7 +200,7 @@ def _adapt_mask_to_gradient(weight_mask, grid_shape, axis):
     差分沿 axis 方向会少一个元素，取相邻元素的最大值作为梯度位置的权重。
     Args:
         weight_mask: [B, T, N, 1]
-        grid_shape: numpy array, 形如 [[Nx, Ny, Nz]]
+        grid_shape: numpy array of shape [B, 3] — 同一 batch 内必须相同
         axis: 'x' | 'y' | 'z'
     Returns:
         适配后的 weight_mask，shape 与对应方向的梯度张量一致
@@ -288,15 +299,18 @@ def get_train_loss(fields, predict_hat, label_gt, normalizer, weight_cfg: dict, 
     """返回loss张量及监控指标（其余转为float）。"""
     num_channels = float(len(fields))
 
+    pred_fp32 = predict_hat.float()
+    label_fp32 = label_gt.float()
+    _dev = pred_fp32.device
+
+    # Initialize on the same device as predictions to avoid device mismatch
     losses = {
-        "value_loss": torch.tensor(0),
-        "grad_loss": torch.tensor(0),
+        "value_loss": torch.tensor(0.0, device=_dev),
+        "grad_loss":  torch.tensor(0.0, device=_dev),
         "loss": 0,
         'mean_l2': 0
         }
 
-    pred_fp32 = predict_hat.float()
-    label_fp32 = label_gt.float()
     with torch.no_grad():
         pred_real = normalizer.denormalize(pred_fp32)
         label_real = normalizer.denormalize(label_fp32)
@@ -410,8 +424,9 @@ def get_train_loss(fields, predict_hat, label_gt, normalizer, weight_cfg: dict, 
 
             losses[f"L2_{fname}"] = rel_l2_val
             losses['mean_l2'] += rel_l2_val / num_channels
+            # Store MSE (not RMSE) so callers can accumulate correctly across
+            # batches with different sizes; sqrt is taken at finalization.
             losses[f"RMSE_{fname}"] = rmse[i].item()
-
             if active_mask is not None:
                 ch_active = active_mask[..., i:i+1]
                 ch_inactive = inactive_mask[..., i:i+1]
@@ -486,6 +501,19 @@ def get_val_loss(fields, predict_hat, state, normalizer, active_mask=None):
 
 _REGION_PREFIXES = ("active_L2", "inactive_L2", "active_RMSE", "inactive_RMSE")
 _REGION_MEANS = ("active_mean_l2", "inactive_mean_l2")
+
+
+def _finalize_rmse(agg, fields):
+    """Take sqrt of accumulated MSE to produce true RMSE.
+
+    `_rmse()` returns per-channel MSE so that weighted accumulation across
+    variable-size batches is exact.  This helper converts the averaged MSE back
+    to RMSE and must be called once after the main averaging loop.
+    """
+    for fname in fields:
+        key = f"RMSE_{fname}"
+        if key in agg:
+            agg[key] = math.sqrt(max(agg[key], 0.0))
 
 
 def _init_region_agg(agg, fields):
@@ -619,6 +647,7 @@ def train(args, model, train_dataloader, optim, device, normalizer):
                 agg[key] = value / agg["num"]
 
     agg["each_l2"] = (agg["each_l2"] / agg["num"]).cpu()
+    _finalize_rmse(agg, fields)
     if has_region:
         _finalize_region(agg, fields, agg["num"], include_loss=True)
     return agg
@@ -701,6 +730,7 @@ def validate(args, model, val_dataloader, device, normalizer, epoch):
                 agg[key] = value / agg["num"]
 
     agg["each_l2"] = (agg["each_l2"] / agg["num"]).cpu()
+    _finalize_rmse(agg, fields)
     if has_region:
         _finalize_region(agg, fields, agg["num"], include_loss=False)
     return agg
