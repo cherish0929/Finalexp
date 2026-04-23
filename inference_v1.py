@@ -557,14 +557,17 @@ if __name__ == "__main__":
         # "config/keyhole/GTO_keyhole_stronger.json",
         # "config/keyhole/GTO_attnres_keyhole_stronger.json",
         # "config/keyhole/GTO_attnres_3_keyhole_stronger.json",
-        "config/easypool/fields/single/GTO_ep_s_liquid.json"
+        # "config/easypool/fields/single/GTO_ep_s_liquid.json"
+        "config/keyhole/time_stride2/GTO_keyhole_stronger_time_stride2.json",
+        "config/keyhole/time_stride2/GTO_attnres_keyhole_stronger_time_stride2.json",
+        "config/keyhole/time_stride2/GTO_attnres_3_keyhole_stronger_time_stride2.json"
     ]
 
     FIELD_TO_PLOT = None   # None 表示所有场；或指定如 "T" / "alpha.air"
     SLICE_AXIS = "z"        # 'x', 'y', 'z'
     SLICE_POS = None
     INTERFACE_FIELD = "alpha.air"
-    NUM_SAMPLES = 2  # 每个 config 随机推理的样本数
+    NUM_SAMPLES = 3  # 每个 config 随机推理的样本数
     sample_idxs = [207, 229]
 
     cfg_list = CONFIG_PATH if isinstance(CONFIG_PATH, list) else [CONFIG_PATH]
@@ -573,9 +576,9 @@ if __name__ == "__main__":
         try:
             predictor = AeroGtoPredictor(cfg_path, MODE)
             if FIELD_TO_PLOT is None:
-                OUT_DIR = f"result_ep_single_field/liquid_inference/{predictor.args.name}/{MODE}/batch"
+                OUT_DIR = f"result_keyhole_time_stride2/inference/{predictor.args.name}/{MODE}/batch"
             else:
-                OUT_DIR = f"result_ep_single_field/liquid_inference/{predictor.args.name}/{MODE}/{FIELD_TO_PLOT}"
+                OUT_DIR = f"result_keyhole_time_stride2/inference_result/{predictor.args.name}/{MODE}/{FIELD_TO_PLOT}"
             os.makedirs(OUT_DIR, exist_ok=True)
         except Exception as e:
             print(f"初始化失败: {e}")

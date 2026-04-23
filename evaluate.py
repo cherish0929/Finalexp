@@ -38,20 +38,29 @@ from src.train import validate
 #     "config/easypool/fields/multifields/GTO_a3_ep_s_T_liquid.json"
 # ] 
 CONFIG_LIST = [
-    "config/easypool/GTO_easypool.json",
-    "config/easypool/GTO_easypool_stronger.json",
+    # "config/easypool/GTO_easypool.json",
+    # "config/easypool/GTO_easypool_stronger.json",
     # "config/easypool/GTO_attnres_easypool.json",
-    "config/easypool/GTO_attnres_easypool_stronger.json",
-    "config/easypool/GTO_2_easypool_stronger.json",
-    "config/easypool/GTO_attnres_3_easypool_stronger.json",
+    # "config/easypool/GTO_attnres_easypool_stronger.json",
+    # "config/easypool/GTO_2_easypool_stronger.json",
+    # "config/easypool/GTO_attnres_3_easypool_stronger.json",
     # "config/easypool/cut_GTO_easypool.json",
     # "config/easypool/cut_GTO_attnres_easypool.json",
     # "config/easypool/cut_GTO_attnres_3_easypool.json",
     # "config/keyhole/GTO_keyhole_stronger.json",
     # "config/keyhole/GTO_attnres_keyhole_stronger.json",
     # "config/keyhole/GTO_attnres_3_keyhole_stronger.json",
-    "config/easypool/GTO_attnres_max_ep_s.json",
-    "config/easypool/GTO_attnres_3_ep_s.json"
+    # "config/easypool/GTO_attnres_max_ep_s.json",
+    # "config/easypool/GTO_attnres_3_ep_s.json"
+]
+
+CONFIG_LIST = [
+    "config/keyhole/GTO_keyhole_stronger.json",
+    "config/keyhole/GTO_attnres_keyhole_stronger.json",
+    "config/keyhole/GTO_attnres_3_keyhole_stronger.json",
+    "config/keyhole/time_stride2/GTO_keyhole_stronger_time_stride2.json",
+    "config/keyhole/time_stride2/GTO_attnres_keyhole_stronger_time_stride2.json",
+    "config/keyhole/time_stride2/GTO_attnres_3_keyhole_stronger_time_stride2.json"
 ]
 
 
@@ -94,8 +103,8 @@ def get_dataloader_eval(args, device_type):
     elif space_dim == 2:
         Datasetclass = AeroGtoDataset2D
 
-    args.data["test_list"] = ["./data/con_ep/eval.txt"]
-    step = 5
+    # args.data["test_list"] = ["./data/con_kh/val_con_kh.txt"]
+    step = 4
 
     train_dataset = Datasetclass(args=args, mode="train")
 
@@ -140,6 +149,7 @@ def load_model_and_checkpoint(args, device, cond_dim, default_dt):
     # 加载 checkpoint
     path_nn = args.save_path + "/nn"
     ckpt_path = os.path.join(path_nn, f"{args.name}_best.pt")
+
     if not os.path.exists(ckpt_path):
         return None, f"Checkpoint not found: {ckpt_path}"
 
@@ -434,7 +444,8 @@ def main():
     device = torch.device(device_str)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = f"result_easypool/evaluate/report_{timestamp}.txt"
+    # report_path = f"result_easypool/evaluate/report_{timestamp}.txt"
+    report_path = f"evaluate/report_keyhole.txt"
     logger = DualLogger(report_path)
 
     logger.log(f"{'#'*70}")

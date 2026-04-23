@@ -32,7 +32,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 
-from src.dataset import AeroGtoDataset, AeroGtoDataset2D, CutAeroGtoDataset
+from src.dataset import AeroGtoDataset, AeroGtoDataset2D, CutAeroGtoDataset, LPBFLaserDataset
 from src.train import train, validate, get_train_loss, _init_region_agg, _accumulate_region, _finalize_region
 from src.utils import set_seed, init_weights, parse_args, load_json_config
 
@@ -115,6 +115,36 @@ class EMA:
             if param.requires_grad and name in self.backup:
                 param.data = self.backup[name]
         self.backup = {}
+
+
+# =============================================================================
+# LPBF autoregressive helper
+# =============================================================================
+
+def _autoregressive_lpbf(model, state0, node_pos, edges, time_seq, spatial_inform,
+                          conditions, dt, check_point, batch, device):
+    """Calls model.autoregressive with LPBF-specific extras extracted from batch."""
+    node_pos_abs  = batch.get("node_pos_abs")
+    laser_params  = batch.get("laser_params")
+    laser_traj    = batch.get("laser_traj")
+    abs_time_seq  = batch.get("abs_time_seq")
+
+    T = time_seq.shape[1]
+
+    if laser_traj is not None:
+        laser_traj   = laser_traj[:, :T+1].to(device)
+    if abs_time_seq is not None:
+        abs_time_seq = abs_time_seq[:, :T+1].to(device)
+    if node_pos_abs is not None:
+        node_pos_abs = node_pos_abs.to(device)
+    if laser_params is not None:
+        laser_params = laser_params.to(device).float()
+
+    return model.autoregressive(
+        state0, node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point,
+        node_pos_abs=node_pos_abs, laser_params=laser_params,
+        laser_traj=laser_traj, abs_time_seq=abs_time_seq,
+    )
 
 
 # =============================================================================
@@ -205,7 +235,8 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
     model.train()
     normalizer.to(device)
 
-    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max")
+    _use_lpbf   = model_name == "gto_lpbf"
+    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max", "gto_lpbf")
 
     pbar = tqdm(train_dataloader, desc="  Train(PF)", unit="bt", leave=True, ncols=120, colour='cyan')
 
@@ -241,7 +272,11 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
 
         if use_amp:
             with autocast(device_type="cuda", dtype=torch.bfloat16):
-                if _use_spatial:
+                if _use_lpbf:
+                    predict_hat = _autoregressive_lpbf(
+                        model, state[:, 0], node_pos, edges, time_seq[:, :T_pf],
+                        spatial_inform, conditions, dt, check_point, batch, device)
+                elif _use_spatial:
                     predict_hat = model.autoregressive(
                         state[:, 0], node_pos, edges, time_seq[:, :T_pf], spatial_inform, conditions, dt, check_point)
                 else:
@@ -294,7 +329,11 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
             if ema is not None:
                 ema.update(model)
         else:
-            if _use_spatial:
+            if _use_lpbf:
+                predict_hat = _autoregressive_lpbf(
+                    model, state[:, 0], node_pos, edges, time_seq[:, :T_pf],
+                    spatial_inform, conditions, dt, check_point, batch, device)
+            elif _use_spatial:
                 predict_hat = model.autoregressive(
                     state[:, 0], node_pos, edges, time_seq[:, :T_pf], spatial_inform, conditions, dt, check_point
                 )
@@ -408,7 +447,8 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
     model.train()
     normalizer.to(device)
 
-    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max")
+    _use_lpbf   = model_name == "gto_lpbf"
+    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max", "gto_lpbf")
 
     pbar = tqdm(train_dataloader, desc="  Train", unit="bt", leave=True, ncols=120, colour='green')
     for batch in pbar:
@@ -434,7 +474,11 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
 
         if use_amp:
             with autocast(device_type="cuda", dtype=torch.bfloat16):
-                if _use_spatial:
+                if _use_lpbf:
+                    predict_hat = _autoregressive_lpbf(
+                        model, state[:, 0], node_pos, edges, time_seq,
+                        spatial_inform, conditions, dt, check_point, batch, device)
+                elif _use_spatial:
                     predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point)
                 else:
                     predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
@@ -472,7 +516,11 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
             if ema is not None:
                 ema.update(model)
         else:
-            if _use_spatial:
+            if _use_lpbf:
+                predict_hat = _autoregressive_lpbf(
+                    model, state[:, 0], node_pos, edges, time_seq,
+                    spatial_inform, conditions, dt, check_point, batch, device)
+            elif _use_spatial:
                 predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point)
             else:
                 predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
@@ -577,7 +625,8 @@ def _probe_ckpt_threshold(model, first_batch, device, horizon, args, path_record
 
     use_amp = args.train.get("use_amp", False)
     model_name = args.model.get("name", "PhysGTO")
-    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max")
+    _use_lpbf   = model_name == "gto_lpbf"
+    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max", "gto_lpbf")
 
     # Prepare a single-sample probe batch (use first sample only to minimise memory)
     dt = first_batch['dt'][:1].to(device)
@@ -597,14 +646,22 @@ def _probe_ckpt_threshold(model, first_batch, device, horizon, args, path_record
             model.train()
             if use_amp:
                 with autocast(device_type="cuda", dtype=torch.bfloat16):
-                    if _use_spatial and spatial_inform is not None:
+                    if _use_lpbf:
+                        out = _autoregressive_lpbf(
+                            model, state[:, 0], node_pos, edges, time_seq,
+                            spatial_inform, conditions, dt, ckpt_val, first_batch, device)
+                    elif _use_spatial and spatial_inform is not None:
                         out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
                                                    spatial_inform, conditions, dt, ckpt_val)
                     else:
                         out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
                                                    conditions, dt, ckpt_val)
             else:
-                if _use_spatial and spatial_inform is not None:
+                if _use_lpbf:
+                    out = _autoregressive_lpbf(
+                        model, state[:, 0], node_pos, edges, time_seq,
+                        spatial_inform, conditions, dt, ckpt_val, first_batch, device)
+                elif _use_spatial and spatial_inform is not None:
                     out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
                                                spatial_inform, conditions, dt, ckpt_val)
                 else:
@@ -677,8 +734,13 @@ def get_dataloader(args, path_record, device_type, pf_extra_max=0):
     data_cfg = args.data
     model_cfg = args.model
     space_dim = model_cfg.get("space_size", 3)
+    model_name = model_cfg.get("name", "PhysGTO")
 
-    if space_dim == 3:
+    if model_name == "gto_lpbf":
+        Datasetclass = LPBFLaserDataset
+        # Inject fields into model config so build_model can read them
+        model_cfg["_fields"] = data_cfg.get("fields", ["T"])
+    elif space_dim == 3:
         if data_cfg.get("cut", False):
             Datasetclass = CutAeroGtoDataset
         else:

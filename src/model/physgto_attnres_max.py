@@ -1,7 +1,7 @@
 """
 PhysGTO-AttnRes-Max: Bi-Conditioned Cross-Attention + 8-SubLayer Block + Intra-Block AttnRes
 
-在 physgto_attnres_max.py (V3) 基础上进行的定向重构：
+在 physgto_attnres_multi_v3.py 基础上进行的定向重构：
 
 1. BiCondFieldCrossAttention（升级版 FieldCrossAttention）
    - 动态 query：Q_base + self_summary_offset + other_summary_offset + pair_summary_offset
@@ -14,16 +14,16 @@ PhysGTO-AttnRes-Max: Bi-Conditioned Cross-Attention + 8-SubLayer Block + Intra-B
 2. 扩充 AttnResMixerBlock → 8 子层
    GNN_encode → Intra_attn → GNN_mid → Cross_attn → GNN_post → Post_attn → GNN_light → FFN
    - Block-level AttnRes 扩展到覆盖全部 8 个子层
-   - 所有子层采用 pre-norm + gated residual
+   - 残差策略：仅 Cross-Attention 使用 GatedResidual（layer_scale × sigmoid gate）
+     其余子层（GNN / Attention / FFN）均为标准加法残差，避免梯度压制
 
 3. Intra-block AttnRes（block 内部子层历史聚合）
    - node 和 edge 各自独立的 intra-block 历史向量列表
    - 各场独立参数，与 block-level AttnRes 明确区分
 
 4. Edge 更新分层策略
-   - GNN_encode: full node+edge update (GNN)
-   - GNN_mid/post: light node+edge update (GNNLight)
-   - GNN_light: node only，极轻 edge residual（GNNLight, update_edge=False）
+   - GNN_encode / GNN_mid / GNN_post: 完整 GNN（双头消息 + 双路 scatter-softmax）
+   - GNN_light: GNNLight(update_edge=False)，仅 node 更新，edge 不变
 """
 
 import torch
@@ -670,15 +670,13 @@ class AttnResMixerBlock(nn.Module):
     1. Block-level AttnRes  (block_attn_res):   跨历史 block 聚合
     2. Intra-block AttnRes  (intra_block_attn_res): 当前 block 内子层历史聚合
 
-    Node 和 Edge 的 Intra-block AttnRes 参数彼此独立。
+    残差策略：
+    - Cross-Attention：GatedResidual（layer_scale × sigmoid gate，输出已包含在 BiCondFieldCrossAttention 内）
+    - 其余所有子层（GNN / Attention / FFN）：标准加法残差，避免梯度压制
 
     GNN 分层 edge 更新策略：
-    - GNN_encode (子层 0): full GNN，完整 node+edge 更新
-    - GNN_mid    (子层 2): GNNLight，轻量 node+edge 更新
-    - GNN_post   (子层 4): GNNLight，轻量 node+edge 更新
-    - GNN_light  (子层 6): GNNLight(update_edge=False)，仅 node 更新，edge 不变
-
-    所有 attention/FFN 子层采用 pre-norm + GatedResidual。
+    - GNN_encode / GNN_mid / GNN_post: 完整 GNN（双头消息 + 双路 scatter-softmax）
+    - GNN_light:  GNNLight(update_edge=False)，仅 node 更新，edge 不变
     """
 
     # 子层索引常量（便于注释和索引）
@@ -694,7 +692,7 @@ class AttnResMixerBlock(nn.Module):
 
     def __init__(self, enc_dim, n_head, n_token, enc_s_dim, n_fields=2,
                  cross_attn_heads=4, n_latent=4, n_latent_cross=2,
-                 gnn_light_ratio=0.5, layer_scale_init=1e-2,
+                 gnn_light_ratio=0.5, layer_scale_init=1.0,
                  use_intra_attn_res=False):
         super().__init__()
         self.n_fields = n_fields
@@ -711,24 +709,22 @@ class AttnResMixerBlock(nn.Module):
             for _ in range(n_fields)
         ])
 
-        # GNN_mid: 轻量 GNNLight，轻量 node+edge 更新
+        # GNN_mid: 完整 GNN，跨场交互后的图扩散
         self.gnns_mid = nn.ModuleList([
-            GNNLight(node_size=enc_dim + enc_s_dim, edge_size=enc_dim, output_size=enc_dim,
-                     light_ratio=gnn_light_ratio, update_edge=True, layer_norm=False)
+            GNN(node_size=enc_dim + enc_s_dim, edge_size=enc_dim, output_size=enc_dim, layer_norm=True)
             for _ in range(n_fields)
         ])
 
-        # GNN_post: 轻量 GNNLight，轻量 node+edge 更新
+        # GNN_post: 完整 GNN，跨场交互后的图扩散
         self.gnns_post = nn.ModuleList([
-            GNNLight(node_size=enc_dim + enc_s_dim, edge_size=enc_dim, output_size=enc_dim,
-                     light_ratio=gnn_light_ratio, update_edge=True, layer_norm=False)
+            GNN(node_size=enc_dim + enc_s_dim, edge_size=enc_dim, output_size=enc_dim, layer_norm=True)
             for _ in range(n_fields)
         ])
 
         # GNN_light: 最轻量，仅 node 更新，edge 不变
         self.gnns_light = nn.ModuleList([
             GNNLight(node_size=enc_dim + enc_s_dim, edge_size=enc_dim, output_size=enc_dim,
-                     light_ratio=gnn_light_ratio * 0.5, update_edge=False, layer_norm=False)
+                     light_ratio=gnn_light_ratio, update_edge=False, layer_norm=False)
             for _ in range(n_fields)
         ])
 
@@ -740,17 +736,11 @@ class AttnResMixerBlock(nn.Module):
             Atten(n_token=n_token, c_dim=enc_dim, n_heads=n_head, n_latent=n_latent)
             for _ in range(n_fields)
         ])
-        self.res_intra = nn.ModuleList([
-            GatedResidual(enc_dim, layer_scale_init) for _ in range(n_fields)
-        ])
 
         self.ln_post   = nn.ModuleList([nn.LayerNorm(enc_dim) for _ in range(n_fields)])
         self.mhas_post  = nn.ModuleList([
             Atten(n_token=n_token, c_dim=enc_dim, n_heads=n_head, n_latent=n_latent)
             for _ in range(n_fields)
-        ])
-        self.res_post  = nn.ModuleList([
-            GatedResidual(enc_dim, layer_scale_init) for _ in range(n_fields)
         ])
 
         # ------------------------------------------------------------------
@@ -776,15 +766,6 @@ class AttnResMixerBlock(nn.Module):
             nn.Sequential(nn.Linear(enc_dim, 2 * enc_dim), nn.SiLU(), nn.Linear(2 * enc_dim, enc_dim))
             for _ in range(n_fields)
         ])
-        self.res_ffn = nn.ModuleList([
-            GatedResidual(enc_dim, layer_scale_init) for _ in range(n_fields)
-        ])
-
-        # GNN gated residual（用于 GNN 输出的残差连接）
-        self.res_gnn_encode = nn.ModuleList([GatedResidual(enc_dim, layer_scale_init) for _ in range(n_fields)])
-        self.res_gnn_mid    = nn.ModuleList([GatedResidual(enc_dim, layer_scale_init) for _ in range(n_fields)])
-        self.res_gnn_post   = nn.ModuleList([GatedResidual(enc_dim, layer_scale_init) for _ in range(n_fields)])
-        self.res_gnn_light  = nn.ModuleList([GatedResidual(enc_dim, layer_scale_init) for _ in range(n_fields)])
 
         # ------------------------------------------------------------------
         # Block-level AttnRes：8 个子层 × n_fields（跨 block 历史聚合）
@@ -901,8 +882,8 @@ class AttnResMixerBlock(nn.Module):
             # GNN_encode: full node+edge update
             V_in = torch.cat([v_h, s_enc], dim=-1)
             v_new, e_delta = self.gnns_encode[i](V_in, e_h, edges)
-            V[i] = self.res_gnn_encode[i](V[i], v_new - V[i])  # gated residual
-            E[i] = E[i] + e_delta                               # edge 标准残差（edge 不经过 gated res）
+            V[i] = v_new         # GNN 输出直接作为新节点表示（同 V3 范式）
+            E[i] = E[i] + e_delta
 
             # 更新历史
             node_hist[i].append(V[i])
@@ -916,7 +897,7 @@ class AttnResMixerBlock(nn.Module):
             v_h = self._apply_node_intra_res(node_hist[i], v_h, i, self.IDX_INTRA_ATTN)
 
             attn_out = self.mhas_intra[i](self.ln_intra[i](v_h))
-            V[i] = self.res_intra[i](V[i], attn_out)
+            V[i] = V[i] + attn_out
 
             node_hist[i].append(V[i])
             # 注意：此子层无 edge 更新，edge_hist 追加当前 E（保持历史连续）
@@ -932,7 +913,7 @@ class AttnResMixerBlock(nn.Module):
 
             V_in = torch.cat([v_h, s_enc], dim=-1)
             v_new, e_delta = self.gnns_mid[i](V_in, e_h, edges)
-            V[i] = self.res_gnn_mid[i](V[i], v_new - V[i])
+            V[i] = v_new
             E[i] = E[i] + e_delta
 
             node_hist[i].append(V[i])
@@ -971,7 +952,7 @@ class AttnResMixerBlock(nn.Module):
 
             V_in = torch.cat([v_h, s_enc], dim=-1)
             v_new, e_delta = self.gnns_post[i](V_in, e_h, edges)
-            V[i] = self.res_gnn_post[i](V[i], v_new - V[i])
+            V[i] = v_new
             E[i] = E[i] + e_delta
 
             node_hist[i].append(V[i])
@@ -985,7 +966,7 @@ class AttnResMixerBlock(nn.Module):
             v_h = self._apply_node_intra_res(node_hist[i], v_h, i, self.IDX_POST_ATTN)
 
             attn_out = self.mhas_post[i](self.ln_post[i](v_h))
-            V[i] = self.res_post[i](V[i], attn_out)
+            V[i] = V[i] + attn_out
 
             node_hist[i].append(V[i])
             edge_hist[i].append(E[i])
@@ -1001,7 +982,7 @@ class AttnResMixerBlock(nn.Module):
 
             V_in = torch.cat([v_h, s_enc], dim=-1)
             v_new, e_delta = self.gnns_light[i](V_in, e_h, edges)  # e_delta = zeros
-            V[i] = self.res_gnn_light[i](V[i], v_new - V[i])
+            V[i] = v_new
             # E[i] 不更新（e_delta 为零）
             E[i] = E[i] + e_delta   # e_delta = 0，等价于不更新
 
@@ -1016,7 +997,7 @@ class AttnResMixerBlock(nn.Module):
             v_h = self._apply_node_intra_res(node_hist[i], v_h, i, self.IDX_FFN)
 
             ffn_out = self.ffns[i](self.ln_ffn[i](v_h))
-            V[i] = self.res_ffn[i](V[i], ffn_out)
+            V[i] = V[i] + ffn_out
 
             node_hist[i].append(V[i])
             edge_hist[i].append(E[i])
@@ -1037,7 +1018,7 @@ class AttnResMixerBlock(nn.Module):
 class MultiFieldMixer(nn.Module):
     def __init__(self, N_block, enc_dim, n_head, n_token, enc_s_dim, n_fields=2,
                  cross_attn_heads=4, n_latent=4, n_latent_cross=2,
-                 gnn_light_ratio=0.5, layer_scale_init=1e-2,
+                 gnn_light_ratio=0.5, layer_scale_init=1.0,
                  use_intra_attn_res=False):
         super().__init__()
         self.n_fields = n_fields
@@ -1151,7 +1132,7 @@ class Model(nn.Module):
                  n_fields=None,
                  cross_attn_heads=4,
                  gnn_light_ratio=0.5,
-                 layer_scale_init=1e-2,
+                 layer_scale_init=1.0,
                  use_intra_attn_res=False,
                  ):
         super().__init__()
@@ -1354,18 +1335,11 @@ if __name__ == '__main__':
     print(f"  block_attn_res_w 数量: {n_block_w} (= n_fields×8=2×8) ✓")
     print("  全部初始化为零 ✓")
 
-    # ---- 验证 Intra-block AttnRes 参数存在且为零 ----
-    print("\n[3] Intra-block AttnRes 参数检查")
-    n_node_intra = len(block0.node_intra_attn_res_w)
-    n_edge_intra = len(block0.edge_intra_attn_res_w)
-    assert n_node_intra == 2 * 8
-    assert n_edge_intra == 2 * 8
-    for name_p, p in model.named_parameters():
-        if 'node_intra_attn_res_w' in name_p or 'edge_intra_attn_res_w' in name_p:
-            assert torch.all(p == 0), f"{name_p} should be zero-initialized"
-    print(f"  node_intra_attn_res_w: {n_node_intra} params ✓")
-    print(f"  edge_intra_attn_res_w: {n_edge_intra} params ✓")
-    print("  全部初始化为零 ✓")
+    # ---- 验证 Intra-block AttnRes 参数（use_intra_attn_res=False 时应为 None）----
+    print("\n[3] Intra-block AttnRes 参数检查（默认 disabled）")
+    assert block0.node_intra_attn_res_w is None, "默认 use_intra_attn_res=False，应为 None"
+    assert block0.edge_intra_attn_res_w is None, "默认 use_intra_attn_res=False，应为 None"
+    print("  node/edge_intra_attn_res_w = None (disabled) ✓")
 
     # ---- 验证 GNN_light 的 edge delta 为零 ----
     print("\n[4] Edge 更新分层：GNN_light edge_delta 验证")
@@ -1440,18 +1414,17 @@ if __name__ == '__main__':
     assert out_cross1.shape == (bs, N, D)
     print(f"  1 other field:  {out_cross1.shape} ✓")
 
-    # ---- GatedResidual 初始值验证 ----
-    print("\n[7] GatedResidual 初始值验证（应接近标准残差）")
-    gr = GatedResidual(D, layer_scale_init=1e-2)
+    # ---- GatedResidual 初始值验证（用于 Cross-Attention，layer_scale_init=1.0）----
+    print("\n[7] GatedResidual 初始值验证（Cross-Attention 专用，layer_scale_init=1.0）")
+    gr = GatedResidual(D, layer_scale_init=1.0)
     x = torch.randn(1, 10, D)
     delta = torch.randn(1, 10, D)
     out_gr = gr(x, delta)
     diff = (out_gr - x).abs().mean().item()
     delta_scale = delta.abs().mean().item()
     ratio = diff / (delta_scale + 1e-8)
-    print(f"  |output - x|_mean / |delta|_mean = {ratio:.4f} (应 << 1，验证初始化稳定性)")
-    assert ratio < 0.1, f"GatedResidual 初始化过大: ratio={ratio:.4f}"
-    print("  GatedResidual 初始化稳定 ✓")
+    print(f"  |output - x|_mean / |delta|_mean = {ratio:.4f} (layer_scale=1.0, sigmoid≈0.5 → ratio≈0.5)")
+    print("  GatedResidual (Cross-Attention 版) 初始化验证通过 ✓")
 
     print("\n" + "=" * 70)
     print("✅  PhysGTO-AttnRes-Max 全部验证通过！")

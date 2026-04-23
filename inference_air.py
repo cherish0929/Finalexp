@@ -23,7 +23,9 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from scipy.interpolate import griddata
 from scipy.ndimage import gaussian_filter
-import imageio
+from scipy.spatial.distance import cdist
+from skimage.measure import find_contours
+import imageio, random
 from tqdm import tqdm
 from pathlib import Path
 from torch.amp import autocast
@@ -93,6 +95,41 @@ def _interface_band_mae(pred_np, gt_np, band_lo=0.2, band_hi=0.8):
     if mask.sum() == 0:
         return 0.0
     return np.mean(np.abs(pred_np[mask] - gt_np[mask]))
+
+
+def _extract_contour_points(Z_grid, xi, yi, level=0.5):
+    """Extract contour points in physical coordinates from a gridded field."""
+    contours = find_contours(Z_grid, level)
+    if not contours:
+        return None
+    pts = np.vstack(contours)
+    dx = (xi[-1] - xi[0]) / (len(xi) - 1)
+    dy = (yi[-1] - yi[0]) / (len(yi) - 1)
+    phys_pts = np.column_stack([pts[:, 1] * dx + xi[0], pts[:, 0] * dy + yi[0]])
+    return phys_pts
+
+
+def _hausdorff_distance(pts_a, pts_b):
+    if pts_a is None or pts_b is None:
+        return float('nan')
+    D = cdist(pts_a, pts_b)
+    return max(D.min(axis=1).max(), D.min(axis=0).max())
+
+
+def _mean_surface_distance(pts_a, pts_b):
+    if pts_a is None or pts_b is None:
+        return float('nan')
+    D = cdist(pts_a, pts_b)
+    return 0.5 * (D.min(axis=1).mean() + D.min(axis=0).mean())
+
+
+def _contour_length(pts_grid, level=0.5):
+    """Total contour length in grid pixels."""
+    contours = find_contours(pts_grid, level)
+    total = 0.0
+    for c in contours:
+        total += np.sum(np.sqrt(np.sum(np.diff(c, axis=0)**2, axis=1)))
+    return total
 
 
 # ────────────────────────────────────────────
@@ -236,6 +273,10 @@ class AirFieldPredictor:
             pred_real = self.normalizer.denormalize(pred_seq)
             gt_real = self.normalizer.denormalize(gt_seq)
 
+        # clamp VOF fields (gamma_liquid etc.) to [0, 1]
+        for _, idx in self.vof_fields:
+            pred_real[..., idx] = pred_real[..., idx].clamp(0.0, 1.0)
+
         # ---- 全局指标 ----
         metrics = {}
         metrics["MSE_normalized"] = torch.mean((pred_seq - gt_seq) ** 2).item()
@@ -256,6 +297,7 @@ class AirFieldPredictor:
 
             T = pred_np.shape[0]
             ious, dices, band_maes = [], [], []
+            hausdorffs, msds, clr = [], [], []
             for t in range(T):
                 ious.append(_interface_iou(pred_np[t], gt_np[t]))
                 dices.append(_interface_dice(pred_np[t], gt_np[t]))
@@ -267,6 +309,12 @@ class AirFieldPredictor:
             fm["mean_IoU"] = np.mean(ious)
             fm["mean_Dice"] = np.mean(dices)
             fm["mean_band_MAE"] = np.mean(band_maes)
+            fm["Hausdorff_per_step"] = None
+            fm["MSD_per_step"] = None
+            fm["CLR_per_step"] = None
+            fm["mean_Hausdorff"] = float('nan')
+            fm["mean_MSD"] = float('nan')
+            fm["mean_CLR"] = float('nan')
 
             per_field[field_name] = fm
 
@@ -303,10 +351,17 @@ class AirFieldPredictor:
             lines.append(f"  Mean IoU:          {fm['mean_IoU']:.4f}")
             lines.append(f"  Mean Dice:         {fm['mean_Dice']:.4f}")
             lines.append(f"  Mean Band MAE:     {fm['mean_band_MAE']:.4e}")
+            lines.append(f"  Mean Hausdorff:    {fm['mean_Hausdorff']:.4e}")
+            lines.append(f"  Mean MSD:          {fm['mean_MSD']:.4e}")
+            lines.append(f"  Mean CLR:          {fm['mean_CLR']:.3f}")
             lines.append(f"  Per-step L2:       {[f'{v:.4e}' for v in fm['each_step_L2']]}")
             lines.append(f"  Per-step IoU:      {[f'{v:.4f}' for v in fm['IoU_per_step']]}")
             lines.append(f"  Per-step Dice:     {[f'{v:.4f}' for v in fm['Dice_per_step']]}")
             lines.append(f"  Per-step BandMAE:  {[f'{v:.4e}' for v in fm['band_MAE_per_step']]}")
+            if fm['Hausdorff_per_step'] is not None:
+                lines.append(f"  Per-step Hausdorff:{[f'{v:.4e}' for v in fm['Hausdorff_per_step']]}")
+                lines.append(f"  Per-step MSD:      {[f'{v:.4e}' for v in fm['MSD_per_step']]}")
+                lines.append(f"  Per-step CLR:      {[f'{v:.3f}' for v in fm['CLR_per_step']]}")
         lines.append(f"{'='*60}")
 
         text = "\n".join(lines)
@@ -448,6 +503,52 @@ class AirFieldPredictor:
         Zi_gt = np.clip(self._smooth(Zi_gt_raw, sigma=smooth_sigma), 0, 1)
         Zi_pred = np.clip(self._smooth(Zi_pred_raw, sigma=smooth_sigma), 0, 1)
 
+        # ── Contour-based metrics ──
+        gt_contour_pts = _extract_contour_points(Zi_gt, xi, yi, level=0.5)
+        pred_contour_pts = _extract_contour_points(Zi_pred, xi, yi, level=0.5)
+        step_hausdorff = _hausdorff_distance(gt_contour_pts, pred_contour_pts)
+        step_msd = _mean_surface_distance(gt_contour_pts, pred_contour_pts)
+        gt_clen = _contour_length(Zi_gt, 0.5)
+        pred_clen = _contour_length(Zi_pred, 0.5)
+        step_clr = pred_clen / gt_clen if gt_clen > 0 else float('nan')
+
+        if metrics is not None and field_name in metrics.get("per_field", {}):
+            fm = metrics["per_field"][field_name]
+            if fm.get("Hausdorff_per_step") is None:
+                T_total = len(fm["IoU_per_step"])
+                fm["Hausdorff_per_step"] = np.full(T_total, np.nan)
+                fm["MSD_per_step"] = np.full(T_total, np.nan)
+                fm["CLR_per_step"] = np.full(T_total, np.nan)
+            if time_step < len(fm["Hausdorff_per_step"]):
+                fm["Hausdorff_per_step"][time_step] = step_hausdorff
+                fm["MSD_per_step"][time_step] = step_msd
+                fm["CLR_per_step"][time_step] = step_clr
+
+        # Build contour distance map for visualization
+        contour_dist_map = None
+        if gt_contour_pts is not None and pred_contour_pts is not None:
+            gt_mask_img = np.zeros_like(Zi_gt, dtype=bool)
+            for c in find_contours(Zi_gt, 0.5):
+                for pt in c:
+                    r, col = int(round(pt[0])), int(round(pt[1]))
+                    if 0 <= r < Zi_gt.shape[0] and 0 <= col < Zi_gt.shape[1]:
+                        gt_mask_img[r, col] = True
+            if gt_mask_img.any():
+                from scipy.ndimage import distance_transform_edt
+                pred_mask_img = np.zeros_like(Zi_pred, dtype=bool)
+                for c in find_contours(Zi_pred, 0.5):
+                    for pt in c:
+                        r, col = int(round(pt[0])), int(round(pt[1]))
+                        if 0 <= r < Zi_pred.shape[0] and 0 <= col < Zi_pred.shape[1]:
+                            pred_mask_img[r, col] = True
+                if pred_mask_img.any():
+                    dist_to_pred = distance_transform_edt(~pred_mask_img)
+                    dx = (xi[-1] - xi[0]) / (len(xi) - 1)
+                    dy = (yi[-1] - yi[0]) / (len(yi) - 1)
+                    pixel_scale = 0.5 * (dx + dy)
+                    dist_to_pred_phys = dist_to_pred * pixel_scale
+                    contour_dist_map = np.where(gt_mask_img, dist_to_pred_phys, np.nan)
+
         extent = (xi.min(), xi.max(), yi.min(), yi.max())
         imshow_args = dict(extent=extent, origin='lower', aspect='equal')
 
@@ -475,7 +576,10 @@ class AirFieldPredictor:
                 f"L2: {step_l2:.4e}    "
                 f"IoU: {step_iou:.4f}    "
                 f"Dice: {step_dice:.4f}    "
-                f"Band MAE: {step_bmae:.4e}"
+                f"Band MAE: {step_bmae:.4e}    "
+                f"Hausdorff: {step_hausdorff:.4e}    "
+                f"MSD: {step_msd:.4e}    "
+                f"CLR: {step_clr:.3f}"
             )
             metrics_text_mean = (
                 f"Overall   "
@@ -487,15 +591,15 @@ class AirFieldPredictor:
                 f"Mean Band MAE: {fm['mean_band_MAE']:.4e}"
             )
 
-        # 使用 gridspec 布局: 上面 4 个子图, 下方留文本区域
+        # 使用 gridspec 布局: 上面 5 个子图, 下方留文本区域
         has_metrics = metrics_text_step is not None
         fig_h = 8.5 if has_metrics else 6
-        fig = plt.figure(figsize=(26, fig_h))
+        fig = plt.figure(figsize=(32, fig_h))
         if has_metrics:
-            gs = fig.add_gridspec(2, 4, height_ratios=[6, 1.2], hspace=0.12)
+            gs = fig.add_gridspec(2, 5, height_ratios=[6, 1.2], hspace=0.12)
         else:
-            gs = fig.add_gridspec(1, 4)
-        axes = [fig.add_subplot(gs[0, i]) for i in range(4)]
+            gs = fig.add_gridspec(1, 5)
+        axes = [fig.add_subplot(gs[0, i]) for i in range(5)]
 
         # ─── Panel 1: 界面对比图 (核心面板) ───
         diff_field = Zi_pred - Zi_gt
@@ -581,6 +685,24 @@ class AirFieldPredictor:
         ]
         axes[3].legend(handles=legend_err, loc='upper right', framealpha=0.85, fontsize=9)
 
+        # ─── Panel 5: Contour Distance Map ───
+        if contour_dist_map is not None:
+            dist_vmax = np.nanpercentile(contour_dist_map, 99)
+            dist_vmax = max(dist_vmax, 1e-6)
+            im4 = axes[4].imshow(contour_dist_map, cmap='hot', vmin=0, vmax=dist_vmax,
+                                 interpolation='nearest', **imshow_args)
+            self._contour_outlined(axes[4], Xi, Yi, Zi_gt, [0.5],
+                                   color='cyan', lw=1.5, ls='-')
+            self._contour_outlined(axes[4], Xi, Yi, Zi_pred, [0.5],
+                                   color='lime', lw=1.5, ls='--')
+            axes[4].set_title(f"Contour Distance (HD={step_hausdorff:.2e}, MSD={step_msd:.2e})")
+            cb4 = plt.colorbar(im4, ax=axes[4], fraction=0.046, pad=0.03, extend='max')
+            cb4.set_label("Dist to Pred contour (m)")
+        else:
+            axes[4].text(0.5, 0.5, "No contour data", ha='center', va='center',
+                         transform=axes[4].transAxes, fontsize=12)
+            axes[4].set_title("Contour Distance")
+
         for ax in axes:
             ax.set_xlabel(xlabel)
             ax.set_ylabel(ylabel)
@@ -656,6 +778,13 @@ class AirFieldPredictor:
         else:
             print("[GIF] No frames generated.")
 
+        if metrics is not None and field_name in metrics.get("per_field", {}):
+            fm = metrics["per_field"][field_name]
+            if fm["Hausdorff_per_step"] is not None:
+                fm["mean_Hausdorff"] = float(np.nanmean(fm["Hausdorff_per_step"]))
+                fm["mean_MSD"] = float(np.nanmean(fm["MSD_per_step"]))
+                fm["mean_CLR"] = float(np.nanmean(fm["CLR_per_step"]))
+
     # ──────────────────────────────
     #  汇总多样本指标
     # ──────────────────────────────
@@ -672,7 +801,8 @@ class AirFieldPredictor:
         lines.append(f"  {'MSE_normalized':20s}:  mean={np.mean(mse_vals):.4e}  std={np.std(mse_vals):.4e}")
 
         field_names = list(all_metrics[0]["per_field"].keys())
-        metric_keys = ["relative_L2", "RMSE", "mean_IoU", "mean_Dice", "mean_band_MAE"]
+        metric_keys = ["relative_L2", "RMSE", "mean_IoU", "mean_Dice", "mean_band_MAE",
+                       "mean_Hausdorff", "mean_MSD", "mean_CLR"]
         for fname in field_names:
             lines.append(f"\n  --- {fname} ---")
             for k in metric_keys:
@@ -699,9 +829,8 @@ if __name__ == "__main__":
     # CONFIG_PATH = "config/config_alpha_air/easypool_air_3-7_enhanced.json"
     # CONFIG_PATH 也可以是 list，依次处理多个配置：
     CONFIG_PATH = [
-        "config/keyhole/GTO_keyhole_stronger.json",
-        "config/keyhole/GTO_attnres_keyhole_stronger.json",
-        "config/keyhole/GTO_attnres_3_keyhole_stronger.json",
+        "config/easypool/fields/multifields/GTO_a3_ep_s_air_liquid.json",
+        "config/easypool/fields/multifields/GTO_a3_ep_s_T_liquid.json"
     ]
 
     SLICE_AXIS = "z"
@@ -714,7 +843,7 @@ if __name__ == "__main__":
     for cfg_path in cfg_list:
         try:
             predictor = AirFieldPredictor(cfg_path, MODE)
-            OUT_DIR = f"result_keyhole/inference_standard/inference_air/{predictor.args.name}/{MODE}"
+            OUT_DIR = f"result_ep_single_field/inference_liquid/{predictor.args.name}/{MODE}"
             os.makedirs(OUT_DIR, exist_ok=True)
         except Exception as e:
             print(f"Init failed: {e}")
@@ -725,7 +854,7 @@ if __name__ == "__main__":
         dataset_length = len(predictor.dataset)
         print(f"Dataset size: {dataset_length}")
 
-        # sample_idxs = random.sample(range(dataset_length), min(NUM_SAMPLES, dataset_length))
+        sample_idxs = random.sample(range(dataset_length), min(NUM_SAMPLES, dataset_length))
         all_metrics = []
 
         for sample_idx in sample_idxs:
@@ -733,10 +862,9 @@ if __name__ == "__main__":
 
             # 1. 推理 + 指标
             result, metrics = predictor.predict_and_evaluate(sample_idx)
-            predictor.print_metrics(sample_idx, metrics, out_dir=OUT_DIR)
             all_metrics.append(metrics)
 
-            # 2. 对每个 VOF 场分别生成 GIF
+            # 2. 对每个 VOF 场分别生成 GIF (contour metrics computed here)
             for field_name, field_idx in predictor.vof_fields:
                 safe_name = field_name.replace(".", "_")
                 gif_path = os.path.join(OUT_DIR, f"interface_s{sample_idx}_{safe_name}.gif")
@@ -750,5 +878,8 @@ if __name__ == "__main__":
                     metrics=metrics
                 )
 
+            # 3. 打印指标 (after GIF so contour metrics are populated)
+            predictor.print_metrics(sample_idx, metrics)
+
         # 3. 汇总
-        predictor.print_summary(all_metrics, out_dir=OUT_DIR)
+        predictor.print_summary(all_metrics)

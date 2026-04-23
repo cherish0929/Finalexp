@@ -11,4 +11,5 @@ config
 .claude
 references
 utils
+evaluate
 __pycache__

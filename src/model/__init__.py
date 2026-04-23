@@ -25,6 +25,7 @@ from src.model.physgto_attnres_multi_v2 import Model as GTO_attnres_multi_v2
 from src.model.physgto_res_attnres import Model as GTO_res_attnres
 from src.model.physgto_attnres_multi_v3 import Model as GTO_attnres_multi_v3
 from src.model.physgto_attnres_max import Model as GTO_attnres_max
+from src.model.physgto_lpbf import Model as GTO_lpbf
 
 # --------------------------------------------------------------------------- #
 # Registry: model_name (str used in JSON config) → Model class
@@ -39,6 +40,7 @@ MODEL_REGISTRY = {
     "gto_res_attnres":       GTO_res_attnres,
     "gto_attnres_multi_v3":  GTO_attnres_multi_v3,
     "gto_attnres_max":       GTO_attnres_max,
+    "gto_lpbf":              GTO_lpbf,
 }
 
 __all__ = list(MODEL_REGISTRY.keys()) + ["MODEL_REGISTRY", "build_model"]
@@ -107,5 +109,20 @@ def build_model(model_cfg: dict, cond_dim: int, default_dt: float, device):
         kwargs["gnn_light_ratio"]    = model_cfg.get("gnn_light_ratio", 0.5)
         kwargs["layer_scale_init"]   = model_cfg.get("layer_scale_init", 1e-2)
         kwargs["use_intra_attn_res"] = model_cfg.get("use_intra_attn_res", False)
+
+    if model_name == "gto_lpbf":
+        # fields is required — derive from data config if not in model config
+        fields = model_cfg.get("fields", model_cfg.get("_fields", ["T"]))
+        kwargs["fields"]          = fields
+        kwargs["spatial_dim"]     = model_cfg.get("spatial_dim", 10)
+        kwargs["pos_x_boost"]     = model_cfg.get("pos_x_boost", 2)
+        kwargs["n_latent"]        = model_cfg.get("n_latent", 4)
+        kwargs["n_fields"]        = model_cfg.get("n_fields", len(fields))
+        kwargs["cross_attn_heads"]= model_cfg.get("cross_attn_heads", 4)
+        kwargs["d_laser"]         = model_cfg.get("d_laser", 32)
+        kwargs["ortho_weight"]    = model_cfg.get("ortho_weight", 0.01)
+        kwargs["balance_weight"]  = model_cfg.get("balance_weight", 0.05)
+        kwargs["sharp_weight"]    = model_cfg.get("sharp_weight", 0.01)
+        kwargs["stepper_scheme"]  = model_cfg.get("stepper_scheme", "euler")
 
     return ModelClass(**kwargs).to(device)

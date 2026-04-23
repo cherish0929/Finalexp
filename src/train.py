@@ -6,6 +6,26 @@ from tqdm import tqdm
 from pathlib import Path
 from torch.amp import GradScaler, autocast # 引入 AMP 模块
 
+
+def _autoregressive_lpbf(model, state0, node_pos, edges, time_seq, spatial_inform,
+                          conditions, dt, check_point, batch, device):
+    """Extract LPBF extras from batch and call model.autoregressive."""
+    node_pos_abs = batch.get("node_pos_abs")
+    laser_params = batch.get("laser_params")
+    laser_traj   = batch.get("laser_traj")
+    abs_time_seq = batch.get("abs_time_seq")
+    T = time_seq.shape[1]
+    if laser_traj   is not None: laser_traj   = laser_traj[:, :T+1].to(device)
+    if abs_time_seq is not None: abs_time_seq = abs_time_seq[:, :T+1].to(device)
+    if node_pos_abs is not None: node_pos_abs = node_pos_abs.to(device)
+    if laser_params is not None: laser_params = laser_params.to(device).float()
+    return model.autoregressive(
+        state0, node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point,
+        node_pos_abs=node_pos_abs, laser_params=laser_params,
+        laser_traj=laser_traj, abs_time_seq=abs_time_seq,
+    )
+
+
 # l2 误差计算需要反归一化数据
 def _relative_l2(pred, target):
     """相对L2误差，返回 [batch] 张量。"""
@@ -629,7 +649,8 @@ def validate(args, model, val_dataloader, device, normalizer, epoch):
     fields = args.data.get("fields", ["T"])
     use_amp, check_point = args.train.get("use_amp", False), args.train.get("check_point", False)
     model_name = args.model.get("name", "PhysGTO")
-    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max")
+    _use_lpbf   = model_name == "gto_lpbf"
+    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max", "gto_lpbf")
     agg = {}
     for key in ["L2", "mean_l2", "RMSE"]:
         if key == "L2" or key == "RMSE":
@@ -672,13 +693,17 @@ def validate(args, model, val_dataloader, device, normalizer, epoch):
 
             if use_amp:
                 with autocast("cuda", dtype=torch.bfloat16):
-                    if _use_spatial:
+                    if _use_lpbf:
+                        predict_hat = _autoregressive_lpbf(model, state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point, batch, device)
+                    elif _use_spatial:
                         predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point)
                     else:
                         predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
                     costs = get_val_loss(fields, predict_hat, state[:, 1:], normalizer, active_mask=active_mask)
             else:
-                if _use_spatial:
+                if _use_lpbf:
+                    predict_hat = _autoregressive_lpbf(model, state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point, batch, device)
+                elif _use_spatial:
                     predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point)
                 else:
                     predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
