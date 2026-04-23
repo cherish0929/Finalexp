@@ -694,10 +694,12 @@ class AttnResMixerBlock(nn.Module):
 
     def __init__(self, enc_dim, n_head, n_token, enc_s_dim, n_fields=2,
                  cross_attn_heads=4, n_latent=4, n_latent_cross=2,
-                 gnn_light_ratio=0.5, layer_scale_init=1e-2):
+                 gnn_light_ratio=0.5, layer_scale_init=1e-2,
+                 use_intra_attn_res=False):
         super().__init__()
         self.n_fields = n_fields
         self.enc_dim  = enc_dim
+        self.use_intra_attn_res = use_intra_attn_res
         node_size = enc_dim + enc_s_dim   # GNN 输入（node feat + spatial enc）
 
         # ------------------------------------------------------------------
@@ -794,20 +796,26 @@ class AttnResMixerBlock(nn.Module):
         self.block_rms_norm = RMSNorm()
 
         # ------------------------------------------------------------------
-        # Intra-block AttnRes：node 和 edge 各自独立
+        # Intra-block AttnRes：node 和 edge 各自独立（仅当 use_intra_attn_res=True 时启用）
         # node: 8 个子层 × n_fields
         # edge: 8 个子层 × n_fields（无 edge 的子层返回最近 edge，但仍记录）
         # ------------------------------------------------------------------
-        self.node_intra_attn_res_w = nn.ParameterList([
-            nn.Parameter(torch.zeros(enc_dim))
-            for _ in range(n_fields * self.N_SUBLAYERS)
-        ])
-        self.edge_intra_attn_res_w = nn.ParameterList([
-            nn.Parameter(torch.zeros(enc_dim))
-            for _ in range(n_fields * self.N_SUBLAYERS)
-        ])
-        self.node_intra_rms_norm = RMSNorm()
-        self.edge_intra_rms_norm = RMSNorm()
+        if use_intra_attn_res:
+            self.node_intra_attn_res_w = nn.ParameterList([
+                nn.Parameter(torch.zeros(enc_dim))
+                for _ in range(n_fields * self.N_SUBLAYERS)
+            ])
+            self.edge_intra_attn_res_w = nn.ParameterList([
+                nn.Parameter(torch.zeros(enc_dim))
+                for _ in range(n_fields * self.N_SUBLAYERS)
+            ])
+            self.node_intra_rms_norm = RMSNorm()
+            self.edge_intra_rms_norm = RMSNorm()
+        else:
+            self.node_intra_attn_res_w = None
+            self.edge_intra_attn_res_w = None
+            self.node_intra_rms_norm   = None
+            self.edge_intra_rms_norm   = None
 
     # ------ 参数索引辅助 ------
 
@@ -834,7 +842,9 @@ class AttnResMixerBlock(nn.Module):
         )
 
     def _apply_node_intra_res(self, node_hist, current_node, field_idx, sublayer_idx):
-        """对 node 表示做 intra-block AttnRes"""
+        """对 node 表示做 intra-block AttnRes（disabled 时直接返回 current_node）"""
+        if not self.use_intra_attn_res:
+            return current_node
         return intra_block_attn_res(
             node_hist, current_node,
             self._node_intra_w(field_idx, sublayer_idx),
@@ -842,7 +852,9 @@ class AttnResMixerBlock(nn.Module):
         )
 
     def _apply_edge_intra_res(self, edge_hist, current_edge, field_idx, sublayer_idx):
-        """对 edge 表示做 intra-block AttnRes"""
+        """对 edge 表示做 intra-block AttnRes（disabled 时直接返回 current_edge）"""
+        if not self.use_intra_attn_res:
+            return current_edge
         return intra_block_attn_res(
             edge_hist, current_edge,
             self._edge_intra_w(field_idx, sublayer_idx),
@@ -1025,7 +1037,8 @@ class AttnResMixerBlock(nn.Module):
 class MultiFieldMixer(nn.Module):
     def __init__(self, N_block, enc_dim, n_head, n_token, enc_s_dim, n_fields=2,
                  cross_attn_heads=4, n_latent=4, n_latent_cross=2,
-                 gnn_light_ratio=0.5, layer_scale_init=1e-2):
+                 gnn_light_ratio=0.5, layer_scale_init=1e-2,
+                 use_intra_attn_res=False):
         super().__init__()
         self.n_fields = n_fields
         self.blocks = nn.ModuleList([
@@ -1036,6 +1049,7 @@ class MultiFieldMixer(nn.Module):
                 n_latent_cross=n_latent_cross,
                 gnn_light_ratio=gnn_light_ratio,
                 layer_scale_init=layer_scale_init,
+                use_intra_attn_res=use_intra_attn_res,
             )
             for _ in range(N_block)
         ])
@@ -1138,6 +1152,7 @@ class Model(nn.Module):
                  cross_attn_heads=4,
                  gnn_light_ratio=0.5,
                  layer_scale_init=1e-2,
+                 use_intra_attn_res=False,
                  ):
         super().__init__()
 
@@ -1171,6 +1186,7 @@ class Model(nn.Module):
             n_latent_cross=n_latent_cross,
             gnn_light_ratio=gnn_light_ratio,
             layer_scale_init=layer_scale_init,
+            use_intra_attn_res=use_intra_attn_res,
         )
 
         self.decoder = MultiFieldDecoder(

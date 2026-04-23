@@ -554,6 +554,10 @@ def _probe_ckpt_threshold(model, first_batch, device, horizon, args, path_record
     Binary-search for the maximum number of autoregressive steps that can run
     without gradient checkpointing before OOM.
 
+    `horizon` should be the MAXIMUM rollout length that will ever be used during
+    training (i.e. horizon_train + pf_extra_max when pushforward is enabled), so
+    the threshold is safe for the hardest epoch, not just the early easy ones.
+
     Returns an int k (0 <= k <= horizon):
       - k == horizon : no checkpointing needed at all
       - 0 <= k < horizon : use ckp from step k onwards; steps [0, k) run free
@@ -849,20 +853,42 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         print(f"Pushforward: ON (start={pf_start}, extra_max={pf_extra_max}, ramp={pf_ramp})")
 
     # ---- Adaptive checkpoint threshold ----
-    # Probe once with the first batch to find the max steps that fit without ckp.
-    # This overrides the config check_point for the entire training run.
+    # Probe with the MAXIMUM horizon that will ever be used during training:
+    # base horizon + pushforward extra steps (if enabled).  This ensures the
+    # threshold is valid for the hardest epoch, not just the early easy ones.
     horizon_train = args.data.get("horizon_train", 1)
-    try:
-        _first_batch = next(iter(train_dataloader))
-        ckpt_threshold = _probe_ckpt_threshold(
-            model, _first_batch, device, horizon_train, args,
-            path_record=path_record, run_name=args.name
-        )
-        del _first_batch
-        torch.cuda.empty_cache()
-    except Exception as _probe_exc:
-        print(f"[CKP Probe] Probing failed ({_probe_exc}), falling back to config check_point.")
-        ckpt_threshold = None  # fall back to config
+    cfg_ckpt = args.train.get("check_point", False)
+    probe_horizon = horizon_train + (pf_extra_max if pf_enable else 0)
+    if not cfg_ckpt:
+        # Config explicitly disabled checkpointing — skip probe entirely
+        print(f"[CKP] check_point disabled in config, skipping probe.")
+        ckpt_threshold = False
+    else:
+        try:
+            # Find the sample with the most nodes so the probe reflects worst-case memory.
+            # Different files can have different grid shapes, so probing only the first
+            # (random) batch can give an overly optimistic threshold → OOM during training.
+            _ds = train_dataloader.dataset
+            if hasattr(_ds, 'dataset'):  # unwrap torch Subset
+                _ds = _ds.dataset
+            if hasattr(_ds, 'meta_cache') and hasattr(_ds, 'file_paths'):
+                _max_path = max(_ds.file_paths, key=lambda p: _ds.meta_cache[p]["node_pos"].shape[0])
+                _max_idx = next(i for i, (fid, _) in enumerate(_ds.sample_keys)
+                                if _ds.file_paths[fid] == _max_path)
+                print(f"[CKP Probe] Using largest-mesh sample (path={_max_path}, "
+                      f"N={_ds.meta_cache[_max_path]['node_pos'].shape[0]}) for probe.")
+                _first_batch = train_dataloader.collate_fn([_ds[_max_idx]])
+            else:
+                _first_batch = next(iter(train_dataloader))
+            ckpt_threshold = _probe_ckpt_threshold(
+                model, _first_batch, device, probe_horizon, args,
+                path_record=path_record, run_name=args.name
+            )
+            del _first_batch
+            torch.cuda.empty_cache()
+        except Exception as _probe_exc:
+            print(f"[CKP Probe] Probing failed ({_probe_exc}), falling back to config check_point.")
+            ckpt_threshold = True  # fall back to config
 
     # ---- Resume ----
     start_epoch, best_val_error = 0, float("inf")
@@ -894,7 +920,7 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         file.write(f"Pushforward: enable={pf_enable}\n")
         file.write(f"grad_loss_weight: {args.train.get('grad_loss_weight', 8.0)}\n")
         file.write(f"AMP: bf16 autocast (no GradScaler)\n")
-        file.write(f"ckpt_threshold: {ckpt_threshold} (horizon={horizon_train})\n")
+        file.write(f"ckpt_threshold: {ckpt_threshold} (probe_horizon={probe_horizon}, base={horizon_train})\n")
 
     # ---- Early-stop on repeated NaN/skip failures ----
     consecutive_skip_errors = 0

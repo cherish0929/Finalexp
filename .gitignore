@@ -5,8 +5,10 @@ useful
 data
 config
 *.vtk
-*.sh
 *.json
 *.pdf
+*.pyc
 .claude
+references
+utils
 __pycache__

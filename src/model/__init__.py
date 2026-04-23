@@ -103,8 +103,9 @@ def build_model(model_cfg: dict, cond_dim: int, default_dt: float, device):
         kwargs["n_latent"] = model_cfg.get("n_latent", 4)
 
     if model_name == "gto_attnres_max":
-        kwargs["n_latent_cross"]    = model_cfg.get("n_latent_cross", 2)
-        kwargs["gnn_light_ratio"]   = model_cfg.get("gnn_light_ratio", 0.5)
-        kwargs["layer_scale_init"]  = model_cfg.get("layer_scale_init", 1e-2)
+        kwargs["n_latent_cross"]     = model_cfg.get("n_latent_cross", 2)
+        kwargs["gnn_light_ratio"]    = model_cfg.get("gnn_light_ratio", 0.5)
+        kwargs["layer_scale_init"]   = model_cfg.get("layer_scale_init", 1e-2)
+        kwargs["use_intra_attn_res"] = model_cfg.get("use_intra_attn_res", False)
 
     return ModelClass(**kwargs).to(device)

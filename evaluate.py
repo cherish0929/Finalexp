@@ -23,19 +23,35 @@ from src.train import validate
 # ============================================================
 # >>> 在这里填写需要评估的 config 路径 <<<
 # ============================================================
+
+# single field config file list (vs multi fields)
+# CONFIG_LIST = [
+#     "config/easypool/fields/single/GTO_ep_s_T.json",
+#     "config/easypool/fields/single/GTO_a3_ep_s_T.json",
+#     "config/easypool/fields/single/GTO_ep_s_air.json",
+#     "config/easypool/fields/single/GTO_a3_ep_s_air.json",
+#     "config/easypool/fields/single/GTO_ep_s_liquid.json",
+#     "config/easypool/fields/single/GTO_a3_ep_s_liquid.json",
+#     "config/easypool/fields/multifields/GTO_ep_s_air_liquid.json",
+#     "config/easypool/fields/multifields/GTO_a3_ep_s_air_liquid.json",
+#     "config/easypool/fields/multifields/GTO_ep_s_T_liquid.json",
+#     "config/easypool/fields/multifields/GTO_a3_ep_s_T_liquid.json"
+# ] 
 CONFIG_LIST = [
-    # "config/easypool/GTO_easypool.json",
-    # "config/easypool/GTO_easypool_stronger.json",
+    "config/easypool/GTO_easypool.json",
+    "config/easypool/GTO_easypool_stronger.json",
     # "config/easypool/GTO_attnres_easypool.json",
-    # "config/easypool/GTO_attnres_easypool_stronger.json",
-    # "config/easypool/GTO_2_easypool_stronger.json",
-    # "config/easypool/GTO_attnres_3_easypool_stronger.json",
+    "config/easypool/GTO_attnres_easypool_stronger.json",
+    "config/easypool/GTO_2_easypool_stronger.json",
+    "config/easypool/GTO_attnres_3_easypool_stronger.json",
     # "config/easypool/cut_GTO_easypool.json",
     # "config/easypool/cut_GTO_attnres_easypool.json",
     # "config/easypool/cut_GTO_attnres_3_easypool.json",
-    "config/keyhole/GTO_keyhole_stronger.json",
-    "config/keyhole/GTO_attnres_keyhole_stronger.json",
-    "config/keyhole/GTO_attnres_3_keyhole_stronger.json",
+    # "config/keyhole/GTO_keyhole_stronger.json",
+    # "config/keyhole/GTO_attnres_keyhole_stronger.json",
+    # "config/keyhole/GTO_attnres_3_keyhole_stronger.json",
+    "config/easypool/GTO_attnres_max_ep_s.json",
+    "config/easypool/GTO_attnres_3_ep_s.json"
 ]
 
 
@@ -78,6 +94,9 @@ def get_dataloader_eval(args, device_type):
     elif space_dim == 2:
         Datasetclass = AeroGtoDataset2D
 
+    args.data["test_list"] = ["./data/con_ep/eval.txt"]
+    step = 5
+
     train_dataset = Datasetclass(args=args, mode="train")
 
     test_dataset = Datasetclass(
@@ -88,8 +107,8 @@ def get_dataloader_eval(args, device_type):
     test_dataset._sync_norm_cache()
 
     # Use 1/4 of the test set to reduce evaluation time
-    subset_size = max(1, len(test_dataset) // 4)
-    indices = list(range(0, len(test_dataset), 4))[:subset_size]
+    subset_size = max(1, len(test_dataset) // step)
+    indices = list(range(0, len(test_dataset), step))[:subset_size]
     test_dataset = Subset(test_dataset, indices)
 
     pin_memory = "cuda" in device_type
@@ -269,6 +288,19 @@ def evaluate_single(config_path, device, logger):
     args.device = str(device)
     fields = args.data.get("fields", ["T"])
 
+    # 强制关闭所有加权，确保不同训练配置的评估指标可横向比较
+    # (get_val_loss 本身不读 weight_loss，这里做显式保护)
+    # args.train['weight_loss'] = {"enable": False, "gradient": False}
+    args.train['weight_loss'] = {
+        "enable": True,
+        "field": ["T", "alpha.air", "gamma_liquid"],
+        "threshold": [800, [0.4, 0.6],[0.25, 0.75]],
+        "gradient": True,
+        "grad_weight": {"T": 1.0, "alpha.air": 1.0},
+        "grad_loss_multiplier": 0.1,
+        "grad_weight_mode": "adaptive",
+    }
+
     if args.seed is not None:
         set_seed(args.seed)
 
@@ -306,12 +338,15 @@ def evaluate_single(config_path, device, logger):
     normalizer.to(device)
     metrics = validate(args, model, test_dataloader, device, normalizer, epoch=0)
     elapsed = time.time() - t0
-    logger.log(f"  Validation time : {elapsed:.1f}s")
+    n_samples = len(test_dataloader.dataset)
+    logger.log(f"  Validation time : {elapsed:.1f}s  ({elapsed/n_samples*1000:.1f} ms/sample)")
 
     logger.log(f"  --- Results ---")
     print_metrics(logger, metrics, fields)
 
     metrics["_best_val_error"] = ckpt_info["best_val_error"]
+    metrics["_elapsed_s"] = elapsed
+    metrics["_n_samples"] = n_samples
     return args.name, fields, metrics
 
 
@@ -345,6 +380,8 @@ def print_summary_table(logger, results):
     header_parts.append(f"{'act_mean_l2':>14s}")
     header_parts.append(f"{'inact_mean_l2':>14s}")
     header_parts.append(f"{'ckpt_best':>14s}")
+    header_parts.append(f"{'time_s':>10s}")
+    header_parts.append(f"{'ms/sample':>12s}")
 
     header = " | ".join(header_parts)
     logger.log(header)
@@ -371,6 +408,16 @@ def print_summary_table(logger, results):
         else:
             row_parts.append(f"{str(best_ve):>14s}")
 
+        elapsed_s = metrics.get("_elapsed_s")
+        n_samples = metrics.get("_n_samples")
+        if elapsed_s is not None:
+            # row_parts.append(f"{elapsed_s:10.1f}")
+            ms_per = elapsed_s / n_samples * 1000 if n_samples else float('nan')
+            row_parts.append(f"{ms_per:12.1f}")
+        else:
+            # row_parts.append(f"{'N/A':>10s}")
+            row_parts.append(f"{'N/A':>12s}")
+
         logger.log(" | ".join(row_parts))
 
 
@@ -387,7 +434,7 @@ def main():
     device = torch.device(device_str)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = f"result_keyhole/evaluate/report_{timestamp}.txt"
+    report_path = f"result_easypool/evaluate/report_{timestamp}.txt"
     logger = DualLogger(report_path)
 
     logger.log(f"{'#'*70}")
