@@ -24,19 +24,16 @@ from src.train import validate
 # >>> 在这里填写需要评估的 config 路径 <<<
 # ============================================================
 CONFIG_LIST = [
-    # "config/easypool/GTO_easypool.json",
-    # "config/easypool/GTO_easypool_stronger.json",
-    # "config/easypool/GTO_attnres_easypool.json",
-    # "config/easypool/GTO_attnres_easypool_stronger.json",
-    # "config/easypool/GTO_2_easypool_stronger.json",
-    # "config/easypool/GTO_attnres_3_easypool_stronger.json",
-    # "config/easypool/cut_GTO_easypool.json",
-    # "config/easypool/cut_GTO_attnres_easypool.json",
-    # "config/easypool/cut_GTO_attnres_3_easypool.json",
-    "config/keyhole/GTO_keyhole_stronger.json",
-    "config/keyhole/GTO_attnres_keyhole_stronger.json",
-    "config/keyhole/GTO_attnres_3_keyhole_stronger.json",
-]
+    "config/easypool/GNOT_ep_s.json",
+    "config/easypool/GraphViT_ep_s.json",
+    "config/easypool/MGN_ep_s.json",
+    "config/easypool/Transolver_ep_s.json",
+    "config/easypool_scale/ConvLSTM_ep_s.json",
+    "config/easypool_scale/FNO3D_ep_s.json",
+    "config/easypool_scale/MeltPoolResNet_sp_s.json",
+    "config/easypool_scale/ResNet3D_ep_s.json",
+    "config/easypool_scale/Unet3D_ep_s.json"
+    ]
 
 
 # ============================================================
@@ -78,6 +75,7 @@ def get_dataloader_eval(args, device_type):
     elif space_dim == 2:
         Datasetclass = AeroGtoDataset2D
 
+   
     train_dataset = Datasetclass(args=args, mode="train")
 
     test_dataset = Datasetclass(

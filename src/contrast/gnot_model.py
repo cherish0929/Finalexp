@@ -124,15 +124,13 @@ class HeterogeneousNormAttention(nn.Module):
         K = self.k_proj(key_value).view(bs, Nk, H, hd).transpose(1, 2)
         V = self.v_proj(key_value).view(bs, Nk, H, hd).transpose(1, 2)
 
-        # Standard scaled dot-product (the paper uses linear attention for very
-        # large N; swap to F.scaled_dot_product_attention for efficiency)
-        attn = (Q @ K.transpose(-2, -1)) * self.scale      # (bs,H,Nq,Nk)
-        attn = torch.softmax(attn, dim=-1)
-        attn = self.drop(attn)
+        # Flash Attention: never materializes the N×N matrix, O(N) memory
+        dropout_p = self.drop.p if self.training else 0.0
+        out = F.scaled_dot_product_attention(Q, K, V, dropout_p=dropout_p)  # (bs,H,Nq,hd)
 
-        # Apply geometric gate (per-head spatial modulation)
+        # Apply geometric gate (per-head spatial modulation) after attention
         gate = self.geo_gate(query)                                    # (bs,Nq,H,1)
-        out = (attn @ V).transpose(1, 2)                               # (bs,Nq,H,hd)
+        out = out.transpose(1, 2)                                      # (bs,Nq,H,hd)
         out = (out * gate).reshape(bs, Nq, d)
 
         return self.out_proj(out)

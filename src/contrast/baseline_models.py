@@ -251,8 +251,11 @@ class GraphViTModel(_AutoregressiveMixin, nn.Module):
             norm_first=True,          # Pre-LN (more stable)
             dropout=0.0,
         )
+        # enable_flash_sdp: PyTorch ≥2.0 uses Flash Attention automatically
+        # when batch_first=True and no custom attn_mask — no N×N matrix stored
         self.transformer = nn.TransformerEncoder(tf_layer,
-                                                 num_layers=n_attn_layers)
+                                                 num_layers=n_attn_layers,
+                                                 enable_nested_tensor=False)
 
         # ── Decoder ───────────────────────────────────────────────────────
         self.decoder = nn.Sequential(

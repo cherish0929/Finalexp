@@ -13,7 +13,7 @@ from typing import Iterable, List, Optional, Tuple, Union
 import h5py
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from src.utils import ChannelNormalizer, build_active_mask
 
@@ -513,3 +513,89 @@ class AeroGtoDataset(Dataset):
             sample["active_mask"] = active_mask
 
         return sample
+
+
+# ---------------------------------------------------------------------------
+# ShapeGroupedSampler — 按 ds_shape 分桶，确保同 batch 内节点数一致
+# 用于 GNOT / MGN / GraphViT / Transolver 等变长节点数的图/序列模型。
+# 其余模型继续使用 DataLoader 默认的随机 shuffle，无需改动。
+# ---------------------------------------------------------------------------
+
+class ShapeGroupedSampler(Sampler):
+    """
+    将 AeroGtoDataset 的样本按 ds_shape（下采样后网格形状）分桶，
+    每个 batch 内只从同一个桶里采样，从而保证同 batch 节点数相同。
+
+    shuffle=True 时：先在桶内随机打乱，再随机打乱批次顺序（跨桶随机）。
+    shuffle=False 时：保持桶内顺序，批次按桶顺序排列（用于 test）。
+
+    Parameters
+    ----------
+    dataset    : AeroGtoDataset 实例
+    batch_size : 每个 batch 的样本数
+    shuffle    : 是否随机打乱
+    generator  : torch.Generator，用于可复现 shuffle
+    drop_last  : 是否丢弃每桶末尾不足 batch_size 的样本
+    """
+
+    def __init__(self,
+                 dataset: "AeroGtoDataset",
+                 batch_size: int,
+                 shuffle: bool = True,
+                 generator: torch.Generator | None = None,
+                 drop_last: bool = False):
+        super().__init__()
+        self.batch_size = batch_size
+        self.shuffle    = shuffle
+        self.generator  = generator
+        self.drop_last  = drop_last
+
+        # 为每个样本确定其 ds_shape，作为桶 key
+        buckets: dict[tuple, list[int]] = {}
+        for idx, (file_id, _) in enumerate(dataset.sample_keys):
+            path = dataset.file_paths[file_id]
+            shape_key = tuple(dataset.meta_cache[path]["ds_shape"])
+            buckets.setdefault(shape_key, []).append(idx)
+
+        # 按 shape_key 排序以保证确定性（相同 seed 结果一致）
+        self.buckets: list[list[int]] = [buckets[k] for k in sorted(buckets)]
+
+    def _make_batches(self) -> list[list[int]]:
+        batches = []
+        for bucket in self.buckets:
+            indices = list(bucket)
+            if self.shuffle:
+                if self.generator is not None:
+                    perm = torch.randperm(len(indices), generator=self.generator).tolist()
+                else:
+                    perm = torch.randperm(len(indices)).tolist()
+                indices = [indices[i] for i in perm]
+
+            for start in range(0, len(indices), self.batch_size):
+                chunk = indices[start: start + self.batch_size]
+                if self.drop_last and len(chunk) < self.batch_size:
+                    continue
+                batches.append(chunk)
+
+        if self.shuffle:
+            if self.generator is not None:
+                perm = torch.randperm(len(batches), generator=self.generator).tolist()
+            else:
+                perm = torch.randperm(len(batches)).tolist()
+            batches = [batches[i] for i in perm]
+
+        return batches
+
+    def __iter__(self):
+        # batch_sampler 协议：每次 yield 一个完整的 batch（list[int]）
+        for batch in self._make_batches():
+            yield batch
+
+    def __len__(self) -> int:
+        # batch_sampler 协议：返回 batch 数，而非样本数
+        return sum(
+            len(b) // self.batch_size
+            + (0 if self.drop_last or len(b) % self.batch_size == 0 else 1)
+            for b in self.buckets
+        )
+

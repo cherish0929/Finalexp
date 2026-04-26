@@ -9,4 +9,5 @@ config
 *.json
 *.pdf
 .claude
+evaluate
 __pycache__

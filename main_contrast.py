@@ -34,7 +34,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 
-from src.dataset import AeroGtoDataset, CutAeroGtoDataset
+from src.dataset import AeroGtoDataset, CutAeroGtoDataset, ShapeGroupedSampler
 from src.train import train, validate, get_train_loss, _init_region_agg, _accumulate_region, _finalize_region
 from src.utils import set_seed, init_weights, parse_args, load_json_config
 from src.model import build_model, GRID_MODELS
@@ -162,7 +162,6 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
     else:
         check_point = args.train.get("check_point", False)
     weight_loss = args.train.get("weight_loss", {"enable": False})
-    grad_loss_weight = args.train.get("grad_loss_weight", 8.0)
     model_name = args.model.get("name", "PhysGTO")
 
     agg = {}
@@ -215,112 +214,95 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
         # Slice active_mask for base horizon
         base_mask = active_mask[:, :base_horizon] if active_mask is not None else None
 
-        if use_amp:
-            with autocast(device_type="cuda", dtype=torch.bfloat16):
+        # --- forward + loss (with OOM fallback to full checkpointing) ---
+        def _pf_forward_and_loss(ckpt):
+            if use_amp:
+                with autocast(device_type="cuda", dtype=torch.bfloat16):
+                    if _use_spatial:
+                        ph = model.autoregressive(
+                            state[:, 0], node_pos, edges, time_seq[:, :T_pf], spatial_inform, conditions, dt, ckpt)
+                    else:
+                        ph = model.autoregressive(
+                            state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, ckpt)
+                    c = get_train_loss(fields, ph[:, :base_horizon], state[:, 1:base_horizon+1], normalizer, weight_loss, active_mask=base_mask)
+                    lb = c["loss"]
+                    if T_pf > base_horizon and state.shape[1] > base_horizon + 1:
+                        T_extra = min(T_pf, state.shape[1] - 1)
+                        pf_mask = active_mask[:, base_horizon:T_extra] if active_mask is not None else None
+                        c_pf = get_train_loss(
+                            fields, ph[:, base_horizon:T_extra],
+                            state[:, base_horizon+1:T_extra+1], normalizer, weight_loss, active_mask=pf_mask)
+                        lp = c_pf["loss"]
+                        tl = lb + 0.5 * lp
+                    else:
+                        tl = lb
+            else:
                 if _use_spatial:
-                    predict_hat = model.autoregressive(
-                        state[:, 0], node_pos, edges, time_seq[:, :T_pf], spatial_inform, conditions, dt, check_point)
+                    ph = model.autoregressive(
+                        state[:, 0], node_pos, edges, time_seq[:, :T_pf], spatial_inform, conditions, dt, ckpt)
                 else:
-                    predict_hat = model.autoregressive(
-                        state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, check_point)
-                # Loss on original horizon
-                costs = get_train_loss(fields, predict_hat[:, :base_horizon], state[:, 1:base_horizon+1], normalizer, weight_loss, active_mask=base_mask)
-                loss_base = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
-
-                # Loss on extra steps (pushforward)
+                    ph = model.autoregressive(
+                        state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, ckpt)
+                c = get_train_loss(fields, ph[:, :base_horizon], state[:, 1:base_horizon+1], normalizer, weight_loss, active_mask=base_mask)
+                lb = c["loss"]
                 if T_pf > base_horizon and state.shape[1] > base_horizon + 1:
                     T_extra = min(T_pf, state.shape[1] - 1)
                     pf_mask = active_mask[:, base_horizon:T_extra] if active_mask is not None else None
-                    costs_pf = get_train_loss(
-                        fields, predict_hat[:, base_horizon:T_extra],
-                        state[:, base_horizon+1:T_extra+1], normalizer, weight_loss, active_mask=pf_mask
-                    )
-                    loss_pf = costs_pf["value_loss"] + grad_loss_weight * costs_pf["grad_loss"]
-                    total_loss = loss_base + 0.5 * loss_pf  # pushforward weighted less
+                    c_pf = get_train_loss(
+                        fields, ph[:, base_horizon:T_extra],
+                        state[:, base_horizon+1:T_extra+1], normalizer, weight_loss, active_mask=pf_mask)
+                    lp = c_pf["loss"]
+                    tl = lb + 0.5 * lp
                 else:
-                    total_loss = loss_base
+                    tl = lb
+            return ph, c, tl
 
-            # NaN guard / Loss spike guard: 跳过异常 batch，并释放计算图显存
-            _skip = False
-            if not torch.isfinite(total_loss):
-                _skip = True
+        _oom_skip = False
+        try:
+            predict_hat, costs, total_loss = _pf_forward_and_loss(check_point)
+        except torch.cuda.OutOfMemoryError:
+            model.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            if check_point is not True:
+                try:
+                    predict_hat, costs, total_loss = _pf_forward_and_loss(True)
+                except torch.cuda.OutOfMemoryError:
+                    model.zero_grad(set_to_none=True)
+                    torch.cuda.empty_cache()
+                    _oom_skip = True
             else:
-                _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
-                if _cur_avg is not None and total_loss.item() > 10 * _cur_avg:
-                    _skip = True
-            if _skip:
-                optim.zero_grad()
-                del predict_hat, costs, loss_base, total_loss
-                if 'costs_pf' in locals(): del costs_pf, loss_pf
-                torch.cuda.empty_cache()
-                continue
+                _oom_skip = True
+        if _oom_skip:
+            continue
 
-            # bf16 autocast without GradScaler
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
-            # Skip step if any gradient is non-finite
-            if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
-                optim.zero_grad()
-                del predict_hat, costs, loss_base, total_loss
-                if 'costs_pf' in locals(): del costs_pf, loss_pf
-                torch.cuda.empty_cache()
-                continue
-            optim.step()
-            optim.zero_grad()
-            if ema is not None:
-                ema.update(model)
+        # NaN guard / Loss spike guard
+        _skip = False
+        if not torch.isfinite(total_loss):
+            _skip = True
         else:
-            if _use_spatial:
-                predict_hat = model.autoregressive(
-                    state[:, 0], node_pos, edges, time_seq[:, :T_pf], spatial_inform, conditions, dt, check_point
-                )
-            else:
-                predict_hat = model.autoregressive(
-                    state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, check_point
-                )
-            costs = get_train_loss(fields, predict_hat[:, :base_horizon], state[:, 1:base_horizon+1], normalizer, weight_loss, active_mask=base_mask)
-            loss_base = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
-
-            if T_pf > base_horizon and state.shape[1] > base_horizon + 1:
-                T_extra = min(T_pf, state.shape[1] - 1)
-                pf_mask = active_mask[:, base_horizon:T_extra] if active_mask is not None else None
-                costs_pf = get_train_loss(
-                    fields, predict_hat[:, base_horizon:T_extra],
-                    state[:, base_horizon+1:T_extra+1], normalizer, weight_loss, active_mask=pf_mask
-                )
-                loss_pf = costs_pf["value_loss"] + grad_loss_weight * costs_pf["grad_loss"]
-                total_loss = loss_base + 0.5 * loss_pf
-            else:
-                total_loss = loss_base
-
-            # NaN guard / Loss spike guard
-            _skip = False
-            if not torch.isfinite(total_loss):
+            _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
+            if _cur_avg is not None and total_loss.item() > 10 * _cur_avg:
                 _skip = True
-            else:
-                _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
-                if _cur_avg is not None and total_loss.item() > 10 * _cur_avg:
-                    _skip = True
-            if _skip:
-                optim.zero_grad()
-                del predict_hat, costs, loss_base, total_loss
-                if 'costs_pf' in locals(): del costs_pf, loss_pf
-                torch.cuda.empty_cache()
-                continue
-
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
-            # Skip step if any gradient is non-finite
-            if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
-                optim.zero_grad()
-                del predict_hat, costs, loss_base, total_loss
-                if 'costs_pf' in locals(): del costs_pf, loss_pf
-                torch.cuda.empty_cache()
-                continue
-            optim.step()
+        if _skip:
             optim.zero_grad()
-            if ema is not None:
-                ema.update(model)
+            del predict_hat, costs, total_loss
+            torch.cuda.empty_cache()
+            continue
+
+        # backward + step
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
+        if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
+            optim.zero_grad()
+            del predict_hat, costs, total_loss
+            torch.cuda.empty_cache()
+            continue
+        optim.step()
+        optim.zero_grad()
+        if ema is not None:
+            ema.update(model)
+
+        costs["loss"] = total_loss
 
         agg["loss"] += costs["loss"].item() * batch_num
         agg["value_loss"] += costs["value_loss"].item() * batch_num
@@ -339,24 +321,30 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
         avg_loss = agg["loss"] / agg["num"]
         pbar.set_postfix({"Loss": f"{avg_loss:.4e}"})
 
-    from src.train import _REGION_PREFIXES, _REGION_MEANS
+    from src.train import _REGION_PREFIXES, _REGION_MEANS, _finalize_rmse
+    if agg["num"] == 0:
+        raise RuntimeError(
+            "train_pushforward: all batches were skipped (NaN/spike/OOM guard triggered every batch). "
+            "Check for gradient explosion, bad input data, or insufficient GPU memory."
+        )
     for key, value in agg.items():
         if key != "each_l2" and key != "num" and not key.endswith("_cnt"):
             if key not in ("active_loss", "inactive_loss") and key not in _REGION_MEANS and not any(key.startswith(p + "_") for p in _REGION_PREFIXES):
                 agg[key] = value / agg["num"]
 
     agg["each_l2"] = (agg["each_l2"] / agg["num"]).cpu()
+    _finalize_rmse(agg, fields)
     if has_region:
         _finalize_region(agg, fields, agg["num"], include_loss=True)
     return agg
 
 
 # =============================================================================
-# Patched train function with configurable grad_loss_weight  (与 main_v2.py 完全相同)
+# Training function  (与 main_v2.py 完全相同)
 # =============================================================================
 
 def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None, ckpt_threshold=None):
-    """train() with configurable grad_loss_weight instead of hardcoded 8.0"""
+    """单步自回归训练，loss 由 get_train_loss 统一合成。"""
     from torch.amp import autocast
 
     horizon = args.data.get("horizon_train", 1) if isinstance(args.data, dict) else getattr(args, "horizon_train", 1)
@@ -365,7 +353,6 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
     # ckpt_threshold overrides config check_point when provided (set by _probe_ckpt_threshold)
     check_point = ckpt_threshold if ckpt_threshold is not None else args.train.get("check_point", False)
     weight_loss = args.train.get("weight_loss", {"enable": False})
-    grad_loss_weight = args.train.get("grad_loss_weight", 8.0)
     model_name = args.model.get("name", "PhysGTO")
 
     agg = {}
@@ -408,84 +395,69 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
 
         batch_num = state.shape[0]
 
-        if use_amp:
-            with autocast(device_type="cuda", dtype=torch.bfloat16):
+        # --- forward + loss (with OOM fallback to full checkpointing) ---
+        def _forward_and_loss(ckpt):
+            if use_amp:
+                with autocast(device_type="cuda", dtype=torch.bfloat16):
+                    if _use_spatial:
+                        ph = model.autoregressive(state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, ckpt)
+                    else:
+                        ph = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, ckpt)
+                    c = get_train_loss(fields, ph, state[:, 1:], normalizer, weight_loss, active_mask=active_mask)
+            else:
                 if _use_spatial:
-                    predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point)
+                    ph = model.autoregressive(state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, ckpt)
                 else:
-                    predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
+                    ph = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, ckpt)
+                c = get_train_loss(fields, ph, state[:, 1:], normalizer, weight_loss, active_mask=active_mask)
+            return ph, c
 
-                costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss, active_mask=active_mask)
-
-            # Use configurable grad_loss_weight
-            loss = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
-
-            # NaN guard / Loss spike guard: 跳过异常 batch，并释放计算图显存
-            _skip = False
-            if not torch.isfinite(loss):
-                _skip = True
+        _oom_skip = False
+        try:
+            predict_hat, costs = _forward_and_loss(check_point)
+        except torch.cuda.OutOfMemoryError:
+            model.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            if check_point is not True:
+                try:
+                    predict_hat, costs = _forward_and_loss(True)
+                except torch.cuda.OutOfMemoryError:
+                    model.zero_grad(set_to_none=True)
+                    torch.cuda.empty_cache()
+                    _oom_skip = True
             else:
-                _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
-                if _cur_avg is not None and loss.item() > 10 * _cur_avg:
-                    _skip = True
-            if _skip:
-                optim.zero_grad()
-                del predict_hat, costs, loss
-                torch.cuda.empty_cache()
-                continue
+                _oom_skip = True
+        if _oom_skip:
+            continue
 
-            # bf16 autocast without GradScaler — more stable than fp16+scaler
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
-            # Skip step if any gradient is non-finite (prevents corrupting weights)
-            if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
-                optim.zero_grad()
-                del predict_hat, costs, loss
-                torch.cuda.empty_cache()
-                continue
-            optim.step()
-            optim.zero_grad()
-            if ema is not None:
-                ema.update(model)
+        loss = costs["loss"]
+
+        # NaN guard / Loss spike guard
+        _skip = False
+        if not torch.isfinite(loss):
+            _skip = True
         else:
-            if _use_spatial:
-                predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point)
-            else:
-                predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
-
-            costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss, active_mask=active_mask)
-
-            loss = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
-
-            # NaN guard / Loss spike guard
-            _skip = False
-            if not torch.isfinite(loss):
+            _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
+            if _cur_avg is not None and loss.item() > 10 * _cur_avg:
                 _skip = True
-            else:
-                _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
-                if _cur_avg is not None and loss.item() > 10 * _cur_avg:
-                    _skip = True
-            if _skip:
-                optim.zero_grad()
-                del predict_hat, costs, loss
-                torch.cuda.empty_cache()
-                continue
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
-            # Skip step if any gradient is non-finite
-            if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
-                optim.zero_grad()
-                del predict_hat, costs, loss
-                torch.cuda.empty_cache()
-                continue
-            optim.step()
+        if _skip:
             optim.zero_grad()
-            if ema is not None:
-                ema.update(model)
+            del predict_hat, costs, loss
+            torch.cuda.empty_cache()
+            continue
 
-        # For logging, store the combined loss into costs
-        costs["loss"] = loss
+        # backward + step
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
+        if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
+            optim.zero_grad()
+            del predict_hat, costs, loss
+            torch.cuda.empty_cache()
+            continue
+        optim.step()
+        optim.zero_grad()
+        if ema is not None:
+            ema.update(model)
 
         agg["loss"] += costs["loss"].item() * batch_num
         agg["value_loss"] += costs["value_loss"].item() * batch_num
@@ -504,7 +476,7 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
         avg_loss = agg["loss"] / agg["num"]
         pbar.set_postfix({"Loss": f"{avg_loss:.4e}"})
 
-    from src.train import _REGION_PREFIXES, _REGION_MEANS
+    from src.train import _REGION_PREFIXES, _REGION_MEANS, _finalize_rmse
     if agg["num"] == 0:
         raise RuntimeError(
             "train_v2: all batches were skipped (NaN/spike guard triggered every batch). "
@@ -516,24 +488,36 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
                 agg[key] = value / agg["num"]
 
     agg["each_l2"] = (agg["each_l2"] / agg["num"]).cpu()
+    _finalize_rmse(agg, fields)
     if has_region:
         _finalize_region(agg, fields, agg["num"], include_loss=True)
     return agg
 
 
 # =============================================================================
-# Adaptive checkpoint threshold probing  (与 main_v2.py 完全相同)
+# Adaptive checkpoint threshold probing  (per-horizon table, synced from main_v2)
 # =============================================================================
 
-def _probe_ckpt_threshold(model, first_batch, device, horizon, args, path_record="", run_name=""):
+def _probe_ckpt_threshold(model, first_batch, device, horizon, args,
+                          path_record="", run_name="", optimizer=None, normalizer=None):
     """
-    Binary-search for the maximum number of autoregressive steps that can run
-    without gradient checkpointing before OOM.
+    Build a per-horizon checkpoint threshold table.
+
+    For each possible rollout length h in [1, horizon], binary-search for the
+    maximum number of free (non-checkpointed) steps before OOM.
+
+    Returns a dict  {h: threshold}  where:
+      - threshold == h      -> horizon h needs no checkpointing at all
+      - 0 <= threshold < h  -> steps [0, threshold) free, [threshold, h) use ckp
+      - threshold is True   -> even full ckp OOMs at this horizon (fallback)
+
+    At training time, look up ckpt_table[actual_horizon] to get the optimal
+    threshold for the current epoch's rollout length.
     """
     if not torch.cuda.is_available():
-        return False
+        return {h: False for h in range(1, horizon + 1)}
     if horizon <= 1:
-        return False
+        return {1: False}
 
     from torch.amp import autocast
 
@@ -541,41 +525,56 @@ def _probe_ckpt_threshold(model, first_batch, device, horizon, args, path_record
     model_name = args.model.get("name", "PhysGTO")
     _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max")
 
-    # Prepare a single-sample probe batch (use first sample only to minimise memory)
     dt = first_batch['dt'][:1].to(device)
-    state = first_batch["state"][:1, :horizon + 1].to(device)
+    state_full = first_batch["state"][:1, :horizon + 1].to(device)
     node_pos = first_batch["node_pos"][:1].to(device)
     edges = first_batch["edges"][:1].to(device)
-    time_seq = first_batch["time_seq"][:1, :horizon].to(device)
+    time_seq_full = first_batch["time_seq"][:1, :horizon].to(device)
     conditions = first_batch["conditions"][:1].to(device).float()
     spatial_inform = None
     if _use_spatial and "spatial_inform" in first_batch:
         spatial_inform = first_batch["spatial_inform"][:1].to(device)
 
-    def _try(ckpt_val):
-        """Run forward+backward with given check_point value. Returns True on success."""
+    fields = args.data.get("fields", ["T"])
+    weight_loss = args.train.get("weight_loss", {"enable": False})
+    if weight_loss.get("gradient", False) and "grid_shape" in first_batch:
+        weight_loss = dict(weight_loss)
+        weight_loss["grid_shape"] = first_batch["grid_shape"][:1].numpy()
+
+    normalizer_ref = normalizer
+
+    def _try(h, ckpt_val):
+        """Run forward+backward with h steps and given check_point value."""
         torch.cuda.empty_cache()
+        _state = state_full[:, :h + 1]
+        _time_seq = time_seq_full[:, :h]
         try:
             model.train()
             if use_amp:
                 with autocast(device_type="cuda", dtype=torch.bfloat16):
                     if _use_spatial and spatial_inform is not None:
-                        out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
+                        out = model.autoregressive(_state[:, 0], node_pos, edges, _time_seq,
                                                    spatial_inform, conditions, dt, ckpt_val)
                     else:
-                        out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
+                        out = model.autoregressive(_state[:, 0], node_pos, edges, _time_seq,
                                                    conditions, dt, ckpt_val)
             else:
                 if _use_spatial and spatial_inform is not None:
-                    out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
+                    out = model.autoregressive(_state[:, 0], node_pos, edges, _time_seq,
                                                spatial_inform, conditions, dt, ckpt_val)
                 else:
-                    out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
+                    out = model.autoregressive(_state[:, 0], node_pos, edges, _time_seq,
                                                conditions, dt, ckpt_val)
-            loss = out.float().sum()
+            if normalizer_ref is not None:
+                costs = get_train_loss(fields, out, _state[:, 1:h+1], normalizer_ref, weight_loss)
+                loss = costs["loss"]
+            else:
+                loss = out.float().sum()
             loss.backward()
             model.zero_grad(set_to_none=True)
             del out, loss
+            if normalizer_ref is not None:
+                del costs
             torch.cuda.empty_cache()
             return True
         except torch.cuda.OutOfMemoryError:
@@ -596,29 +595,71 @@ def _probe_ckpt_threshold(model, first_batch, device, horizon, args, path_record
             except Exception:
                 pass
 
-    _log(f"[CKP Probe] Probing checkpoint threshold (horizon={horizon}) ...")
+    _log(f"[CKP Probe] Building per-horizon checkpoint table (max horizon={horizon}) ...")
 
-    # Step 1: try without any checkpointing
-    if _try(False):
-        _log(f"[CKP Probe] No OOM without ckp → ckpt_threshold={horizon} (no ckp used)")
-        return horizon  # no ckp needed
+    # Warm up optimizer state (Adam m/v) so probe sees realistic memory usage
+    if optimizer is not None and len(optimizer.state) == 0:
+        _log("[CKP Probe] Warming up optimizer state (Adam m/v not yet allocated)...")
+        try:
+            _param_backup = [p.data.clone() for p in model.parameters() if p.requires_grad]
+            model.train()
+            _dummy_loss = sum(p.sum() for p in model.parameters() if p.requires_grad)
+            _dummy_loss.backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            for p, backup in zip((q for q in model.parameters() if q.requires_grad), _param_backup):
+                p.data.copy_(backup)
+            del _param_backup, _dummy_loss
+            torch.cuda.empty_cache()
+            _log("[CKP Probe] Optimizer state allocated.")
+        except Exception as _e:
+            _log(f"[CKP Probe] Optimizer warmup failed ({_e}), continuing without.")
+            model.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
 
-    # Step 2: try with full checkpointing
-    if not _try(True):
-        _log(f"[CKP Probe] OOM even with full ckp → falling back to config check_point")
-        return True  # let training handle it (will likely OOM, but that's the user's config)
+    table = {}
+    max_free_from_prev = horizon
 
-    # Step 3: binary search for max k such that _try(k) succeeds
-    lo, hi = 0, horizon - 1
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if _try(mid):
-            lo = mid
+    for h in range(horizon, 0, -1):
+        if _try(h, False):
+            table[h] = h
+            _log(f"[CKP Probe]   horizon={h}: no ckp needed (all {h} steps free)")
+            for hh in range(h - 1, 0, -1):
+                table[hh] = hh
+            _log(f"[CKP Probe]   horizon 1~{h-1}: no ckp needed (smaller than {h})")
+            break
+
+        if not _try(h, True):
+            table[h] = True
+            _log(f"[CKP Probe]   horizon={h}: OOM even with full ckp!")
+            continue
+
+        lo, hi = 0, min(h - 1, max_free_from_prev)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _try(h, mid):
+                lo = mid
+            else:
+                hi = mid - 1
+
+        # Safety margin of 2 to account for memory fragmentation over long training
+        safe_lo = max(0, lo - 2)
+        table[h] = safe_lo
+        max_free_from_prev = lo
+        _log(f"[CKP Probe]   horizon={h}: threshold={safe_lo} "
+             f"(steps [0,{safe_lo}) free, [{safe_lo},{h}) ckp)")
+
+    _log("[CKP Probe] Final table:")
+    for h in sorted(table.keys()):
+        v = table[h]
+        if v is True:
+            _log(f"  h={h}: FULL CKP (still OOM risk)")
+        elif v == h:
+            _log(f"  h={h}: no ckp")
         else:
-            hi = mid - 1
+            _log(f"  h={h}: threshold={v} ({v} free + {h - v} ckp)")
 
-    _log(f"[CKP Probe] ckpt_threshold={lo}: steps [0,{lo}) free, steps [{lo},{horizon}) use ckp")
-    return lo
+    return table
 
 
 # =============================================================================
@@ -718,11 +759,19 @@ class GridGroupedBatchSampler(Sampler):
 def get_dataloader(args, path_record, device_type, pf_extra_max=0):
     """
     创建训练/测试 DataLoader。
-    与 main_v2.py 的区别：额外返回 grid_shape（供 FNO3D / UNet3D 等网格模型使用）。
+    与 main_v2.py 的区别：
+      1. 额外返回 grid_shape（供 FNO3D / UNet3D 等网格模型使用）；
+      2. 对图/序列模型（GNOT/MGN/GraphViT/Transolver）使用 ShapeGroupedSampler，
+         保证同 batch 内节点数相同，其余模型保持原有随机 shuffle 逻辑不变。
     """
+    # 图/序列模型名称集合：这些模型的输入为变长节点序列，需要分桶采样
+    GRAPH_MODELS = {"GNOT", "MGN", "GraphViT", "Transolver"}
+
     data_cfg = args.data
     model_cfg = args.model
     space_dim = model_cfg.get("space_size", 3)
+    model_name = model_cfg.get("name", "PhysGTO")
+    use_grouped_sampler = model_name in GRAPH_MODELS
 
     if space_dim == 3:
         if data_cfg.get("cut", False):
@@ -764,6 +813,7 @@ def get_dataloader(args, path_record, device_type, pf_extra_max=0):
             worker_init_fn=lambda wid: _worker_init_fn(wid, seed),
         )
     else:
+        g = None
         dl_kwargs = {}
 
     train_dataloader = DataLoader(
@@ -799,7 +849,6 @@ def get_dataloader(args, path_record, device_type, pf_extra_max=0):
     # 从数据集获取 grid_shape（所有样本应该相同）
     sample_batch = next(iter(train_dataloader))
     grid_shape = tuple(sample_batch["grid_shape"].tolist()[0])
-    print(grid_shape)
 
     with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
         file.write(f"No. of train samples: {len(train_dataset)}, No. of test samples: {len(test_dataset)}\n")
@@ -807,8 +856,11 @@ def get_dataloader(args, path_record, device_type, pf_extra_max=0):
         file.write(f"Node num: {train_dataset.node_num}, Edge num: {edge_num}, Cond dim: {cond_dim}\n")
         file.write(f"Grid shape: {grid_shape}\n")
         file.write(f"Mean dt: {train_dataset.dt:.4e}\n")
+        n_buckets = len(train_dataloader.batch_sampler._groups)
+        file.write(f"GridGroupedBatchSampler: {n_buckets} node-count buckets, train_bs={data_cfg['train'].get('batchsize', 1)}\n")
 
     return train_dataloader, test_dataloader, train_dataset.normalizer, cond_dim, train_dataset.dt, grid_shape
+
 
 
 # =============================================================================
@@ -917,25 +969,48 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
     if pf_enable:
         print(f"Pushforward: ON (start={pf_start}, extra_max={pf_extra_max}, ramp={pf_ramp})")
 
-    # ---- Adaptive checkpoint threshold (only when config enables it) ----
+    # ---- Adaptive checkpoint threshold (per-horizon table) ----
     horizon_train = args.data.get("horizon_train", 1)
     cfg_ckpt = args.train.get("check_point", False)
+    probe_horizon = horizon_train + (pf_extra_max if pf_enable else 0)
+    ckpt_table = None
     if not cfg_ckpt:
-        # Config explicitly disabled checkpointing — skip probe entirely
         print(f"[CKP] check_point disabled in config, skipping probe.")
-        ckpt_threshold = False
     else:
         try:
-            _first_batch = next(iter(train_dataloader))
-            ckpt_threshold = _probe_ckpt_threshold(
-                model, _first_batch, device, horizon_train, args,
-                path_record=path_record, run_name=args.name
+            _ds = train_dataloader.dataset
+            if hasattr(_ds, 'dataset'):
+                _ds = _ds.dataset
+            if hasattr(_ds, 'meta_cache') and hasattr(_ds, 'file_paths'):
+                _max_path = max(_ds.file_paths, key=lambda p: _ds.meta_cache[p]["node_pos"].shape[0])
+                _max_idx = next(i for i, (fid, _) in enumerate(_ds.sample_keys)
+                                if _ds.file_paths[fid] == _max_path)
+                print(f"[CKP Probe] Using largest-mesh sample (path={_max_path}, "
+                      f"N={_ds.meta_cache[_max_path]['node_pos'].shape[0]}) for probe.")
+                _first_batch = train_dataloader.collate_fn([_ds[_max_idx]])
+            else:
+                _first_batch = next(iter(train_dataloader))
+            ckpt_table = _probe_ckpt_threshold(
+                model, _first_batch, device, probe_horizon, args,
+                path_record=path_record, run_name=args.name,
+                optimizer=optimizer, normalizer=normalizer,
             )
             del _first_batch
             torch.cuda.empty_cache()
         except Exception as _probe_exc:
             print(f"[CKP Probe] Probing failed ({_probe_exc}), falling back to config check_point.")
-            ckpt_threshold = cfg_ckpt  # fall back to config value (True or int)
+            ckpt_table = None
+
+    def _get_ckpt_threshold(actual_horizon):
+        """Look up the optimal checkpoint threshold for a given rollout length."""
+        if ckpt_table is None:
+            return False if not cfg_ckpt else True
+        if actual_horizon in ckpt_table:
+            return ckpt_table[actual_horizon]
+        closest = min(ckpt_table.keys(), key=lambda h: (h < actual_horizon, abs(h - actual_horizon)))
+        if closest >= actual_horizon:
+            return ckpt_table[closest]
+        return ckpt_table.get(max(ckpt_table.keys()), True)
 
     # Resume
     start_epoch, best_val_error = 0, float("inf")
@@ -965,9 +1040,9 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         file.write(f"Scheduler: {sched_type}\n")
         file.write(f"EMA: decay=0.998\n")
         file.write(f"Pushforward: enable={pf_enable}\n")
-        file.write(f"grad_loss_weight: {args.train.get('grad_loss_weight', 8.0)}\n")
+        file.write(f"grad_loss_multiplier: {args.train.get('weight_loss', {}).get('grad_loss_multiplier', 8.0)}\n")
         file.write(f"AMP: bf16 autocast (no GradScaler)\n")
-        file.write(f"ckpt_threshold: {ckpt_threshold} (horizon={horizon_train})\n")
+        file.write(f"ckpt_table: {ckpt_table} (probe_horizon={probe_horizon}, base={horizon_train})\n")
 
     # ---- Early-stop on repeated NaN/skip failures ----
     consecutive_skip_errors = 0
@@ -1023,11 +1098,14 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         # Train
         try:
             if use_pushforward:
+                actual_horizon = horizon_train + pf_extra
+                ckpt_threshold = _get_ckpt_threshold(actual_horizon)
                 train_error = train_pushforward(
                     args, model, train_dataloader, optimizer, device, normalizer,
                     extra_steps=pf_extra, ema=ema, ckpt_threshold=ckpt_threshold
                 )
             else:
+                ckpt_threshold = _get_ckpt_threshold(horizon_train)
                 train_error = train_v2(
                     args, model, train_dataloader, optimizer, device, normalizer,
                     ema=ema, ckpt_threshold=ckpt_threshold
@@ -1052,13 +1130,22 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         except torch.cuda.OutOfMemoryError as e:
             torch.cuda.empty_cache()
             _write_error(path_record, args.name, e,
-                         context=f"train epoch {epoch + 1}/{EPOCH} — CUDA OOM (fatal, stopping)",
+                         context=f"train epoch {epoch + 1}/{EPOCH} — CUDA OOM (skipping epoch)",
                          config_path=config_path)
-            print(f"[FATAL OOM] Epoch {epoch + 1}: CUDA out of memory. Training stopped.")
-            print(f"Error details saved to: {path_record}/{args.name}_training_log.txt")
-            print(f"Full bug report saved to: {path_record}/bug.txt")
-            writer.close()
-            return
+            print(f"[OOM] Epoch {epoch + 1}: CUDA out of memory. Skipping epoch.")
+            scheduler.step()
+            consecutive_skip_errors += 1
+            if consecutive_skip_errors >= max_consecutive_skip_errors:
+                _fatal_msg = (
+                    f"[FATAL] {consecutive_skip_errors} consecutive OOM/skip epochs. "
+                    f"Training aborted at epoch {epoch + 1}/{EPOCH}."
+                )
+                print(_fatal_msg)
+                with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
+                    file.write(_fatal_msg + "\n")
+                writer.close()
+                return
+            continue
         except RuntimeError as e:
             _write_error(path_record, args.name, e,
                          context=f"train epoch {epoch + 1}/{EPOCH}",
@@ -1178,13 +1265,10 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
                 ema.restore(model)
                 torch.cuda.empty_cache()
                 _write_error(path_record, args.name, e,
-                             context=f"validate epoch {epoch + 1}/{EPOCH} — CUDA OOM (fatal, stopping)",
+                             context=f"validate epoch {epoch + 1}/{EPOCH} — CUDA OOM (skipping validation)",
                              config_path=config_path)
-                print(f"[FATAL OOM] Epoch {epoch + 1} validation: CUDA out of memory. Training stopped.")
-                print(f"Error details saved to: {path_record}/{args.name}_training_log.txt")
-                print(f"Full bug report saved to: {path_record}/bug.txt")
-                writer.close()
-                return
+                print(f"[OOM] Epoch {epoch + 1} validation: CUDA out of memory. Skipping validation.")
+                continue
             except KeyboardInterrupt:
                 ema.restore(model)
                 interrupt_epoch = epoch + 1

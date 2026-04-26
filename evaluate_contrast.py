@@ -34,23 +34,16 @@ from src.model import build_model, GRID_MODELS
 # 需要评估的 config 路径列表
 # ============================================================
 CONFIG_LIST = [
-    # PhysGTO 家族（本文方法）
-    # "config/keyhole/GTO_keyhole_stronger.json",
-    # "config/keyhole/GTO_attnres_keyhole_stronger.json",
-    # "config/keyhole/GTO_attnres_3_keyhole_stronger.json",
-
-    # 对比模型配置（待创建）
-    # "config/contrast/MGN.json",
-    # "config/contrast/GNOT.json",
-    # "config/contrast/Transolver.json",
-    # "config/contrast/GraphViT.json",
-    # "config/contrast/FNO3D.json",
-    # "config/contrast/UNet3D.json",
-    # "config/contrast/MeltPoolResNet.json",
-    # "config/contrast/ConvLSTMModel.json",
-    # "config/contrast/ResNet3DModel.json",
+    "config/easypool/GNOT_ep_s.json",
+    "config/easypool/GraphViT_ep_s.json",
+    "config/easypool/MGN_ep_s.json",
+    "config/easypool/Transolver_ep_s.json",
+    "config/easypool_scale/ConvLSTM_ep_s.json",
+    "config/easypool_scale/FNO3D_ep_s.json",
+    "config/easypool_scale/MeltPoolResNet_sp_s.json",
+    "config/easypool_scale/ResNet3D_ep_s.json",
+    "config/easypool_scale/Unet3D_ep_s.json"
 ]
-
 
 # ============================================================
 # DualLogger — 同时打印到终端和文件
@@ -88,6 +81,9 @@ def get_dataloader_eval(args, device_type):
     else:
         Datasetclass = AeroGtoDataset
 
+    args.data["test_list"], step = ["./data/con_ep/eval.txt"], 5
+    args.data["test"]["batchsize"] = 1
+
     train_dataset = Datasetclass(args=args, mode="train")
 
     test_dataset = Datasetclass(
@@ -98,7 +94,7 @@ def get_dataloader_eval(args, device_type):
     test_dataset._sync_norm_cache()
 
     # 使用 1/4 测试集加速
-    subset_size = max(1, len(test_dataset) // 4)
+    subset_size = max(1, len(test_dataset) // step)
     indices = list(range(0, len(test_dataset), 4))[:subset_size]
     test_dataset = Subset(test_dataset, indices)
 
@@ -116,7 +112,7 @@ def get_dataloader_eval(args, device_type):
 
     # 获取 grid_shape
     sample_batch = next(iter(test_dataloader))
-    grid_shape = tuple(sample_batch["grid_shape"].tolist())
+    grid_shape = tuple(sample_batch["grid_shape"].tolist()[0])
 
     return test_dataloader, train_dataset.normalizer, cond_dim, default_dt, grid_shape
 
@@ -448,7 +444,10 @@ def print_summary_table(logger, results):
     header_parts = [f"{'Name':30s}", f"{'mean_l2':>12s}"]
     for f in all_fields:
         header_parts.append(f"{'L2_'+f:>12s}")
+        header_parts.append(f"{'RMSE_'+f:>12s}")
     header_parts.extend([
+        f"{'act_mean_l2':>14s}",
+        f"{'inact_mean_l2':>14s}",
         f"{'params(M)':>12s}",
         f"{'time(ms)':>12s}",
         f"{'mem(MB)':>10s}",
@@ -465,7 +464,14 @@ def print_summary_table(logger, results):
 
         for f in all_fields:
             l2_val = metrics.get(f"L2_{f}")
+            rmse_val = metrics.get(f"RMSE_{f}")
             row_parts.append(f"{l2_val:12.4e}" if isinstance(l2_val, float) else f"{'N/A':>12s}")
+            row_parts.append(f"{rmse_val:12.4e}" if isinstance(rmse_val, float) else f"{'N/A':>12s}")
+
+        a_mean = metrics.get("active_mean_l2", float('nan'))
+        i_mean = metrics.get("inactive_mean_l2", float('nan'))
+        row_parts.append(f"{a_mean:14.4e}" if not math.isnan(a_mean) else f"{'N/A':>14s}")
+        row_parts.append(f"{i_mean:14.4e}" if not math.isnan(i_mean) else f"{'N/A':>14s}")
 
         row_parts.append(f"{metrics.get('params_m', 0):12.2f}")
         row_parts.append(f"{metrics.get('avg_time_ms', 0):12.2f}" if metrics.get('avg_time_ms') else f"{'N/A':>12s}")
@@ -493,7 +499,7 @@ def main():
     device = torch.device(device_str)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = f"result/contrast/evaluate/report_{timestamp}.txt"
+    report_path = f"evaluate/report_{timestamp}.txt"
     logger = DualLogger(report_path)
 
     logger.log(f"{'#'*70}")

@@ -32,7 +32,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 
-from src.dataset import AeroGtoDataset, AeroGtoDataset2D, CutAeroGtoDataset
+from src.dataset import AeroGtoDataset, CutAeroGtoDataset
 from src.train import train, validate, get_train_loss, _init_region_agg, _accumulate_region, _finalize_region
 from src.utils import set_seed, init_weights, parse_args, load_json_config
 
@@ -346,6 +346,8 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
             if ema is not None:
                 ema.update(model)
 
+        costs["loss"] = total_loss
+
         agg["loss"] += costs["loss"].item() * batch_num
         agg["value_loss"] += costs["value_loss"].item() * batch_num
         agg["grad_loss"] += costs["grad_loss"].item() * batch_num
@@ -551,25 +553,25 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
 # Adaptive checkpoint threshold probing
 # =============================================================================
 
-def _probe_ckpt_threshold(model, first_batch, device, horizon, args, path_record="", run_name=""):
+def _probe_ckpt_threshold(model, first_batch, device, horizon, args, path_record="", run_name="", optimizer=None, normalizer=None):
     """
-    Binary-search for the maximum number of autoregressive steps that can run
-    without gradient checkpointing before OOM.
+    Build a per-horizon checkpoint threshold table.
 
-    Returns an int k (0 <= k <= horizon):
-      - k == horizon : no checkpointing needed at all
-      - 0 <= k < horizon : use ckp from step k onwards; steps [0, k) run free
-      - returns True if even full ckp OOMs (fall back to config)
+    For each possible rollout length h in [1, horizon], binary-search for the
+    maximum number of free (non-checkpointed) steps before OOM.
 
-    The returned value is passed directly as check_point to autoregressive(),
-    which interprets it as:
-      check_point is True  → all steps use ckp
-      type(check_point) is int and t >= check_point → ckp from step k onwards
+    Returns a dict  {h: threshold}  where:
+      - threshold == h      → horizon h needs no checkpointing at all
+      - 0 <= threshold < h  → steps [0, threshold) free, [threshold, h) use ckp
+      - threshold is True   → even full ckp OOMs at this horizon (fallback)
+
+    At training time, look up ckpt_table[actual_horizon] to get the optimal
+    threshold for the current epoch's rollout length.
     """
     if not torch.cuda.is_available():
-        return False
+        return {h: False for h in range(1, horizon + 1)}
     if horizon <= 1:
-        return False
+        return {1: False}
 
     from torch.amp import autocast
 
@@ -577,41 +579,57 @@ def _probe_ckpt_threshold(model, first_batch, device, horizon, args, path_record
     model_name = args.model.get("name", "PhysGTO")
     _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max")
 
-    # Prepare a single-sample probe batch (use first sample only to minimise memory)
     dt = first_batch['dt'][:1].to(device)
-    state = first_batch["state"][:1, :horizon + 1].to(device)
+    state_full = first_batch["state"][:1, :horizon + 1].to(device)
     node_pos = first_batch["node_pos"][:1].to(device)
     edges = first_batch["edges"][:1].to(device)
-    time_seq = first_batch["time_seq"][:1, :horizon].to(device)
+    time_seq_full = first_batch["time_seq"][:1, :horizon].to(device)
     conditions = first_batch["conditions"][:1].to(device).float()
     spatial_inform = None
     if _use_spatial and "spatial_inform" in first_batch:
         spatial_inform = first_batch["spatial_inform"][:1].to(device)
 
-    def _try(ckpt_val):
-        """Run forward+backward with given check_point value. Returns True on success."""
+    fields = args.data.get("fields", ["T"])
+    weight_loss = args.train.get("weight_loss", {"enable": False})
+    grad_loss_weight = args.train.get("grad_loss_weight", 8.0)
+    if weight_loss.get("gradient", False) and "grid_shape" in first_batch:
+        weight_loss = dict(weight_loss)
+        weight_loss["grid_shape"] = first_batch["grid_shape"][:1].numpy()
+
+    normalizer_ref = normalizer
+
+    def _try(h, ckpt_val):
+        """Run forward+backward with h steps and given check_point value."""
         torch.cuda.empty_cache()
+        _state = state_full[:, :h + 1]
+        _time_seq = time_seq_full[:, :h]
         try:
             model.train()
             if use_amp:
                 with autocast(device_type="cuda", dtype=torch.bfloat16):
                     if _use_spatial and spatial_inform is not None:
-                        out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
+                        out = model.autoregressive(_state[:, 0], node_pos, edges, _time_seq,
                                                    spatial_inform, conditions, dt, ckpt_val)
                     else:
-                        out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
+                        out = model.autoregressive(_state[:, 0], node_pos, edges, _time_seq,
                                                    conditions, dt, ckpt_val)
             else:
                 if _use_spatial and spatial_inform is not None:
-                    out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
+                    out = model.autoregressive(_state[:, 0], node_pos, edges, _time_seq,
                                                spatial_inform, conditions, dt, ckpt_val)
                 else:
-                    out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
+                    out = model.autoregressive(_state[:, 0], node_pos, edges, _time_seq,
                                                conditions, dt, ckpt_val)
-            loss = out.float().sum()
+            if normalizer_ref is not None:
+                costs = get_train_loss(fields, out, _state[:, 1:h+1], normalizer_ref, weight_loss)
+                loss = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
+            else:
+                loss = out.float().sum()
             loss.backward()
             model.zero_grad(set_to_none=True)
             del out, loss
+            if normalizer_ref is not None:
+                del costs
             torch.cuda.empty_cache()
             return True
         except torch.cuda.OutOfMemoryError:
@@ -632,30 +650,69 @@ def _probe_ckpt_threshold(model, first_batch, device, horizon, args, path_record
             except Exception:
                 pass
 
-    _log(f"[CKP Probe] Probing checkpoint threshold (horizon={horizon}) ...")
+    _log(f"[CKP Probe] Building per-horizon checkpoint table (max horizon={horizon}) ...")
 
-    # Step 1: try without any checkpointing
-    if _try(False):
-        _log(f"[CKP Probe] No OOM without ckp → ckpt_threshold={horizon} (no ckp used)")
-        return horizon  # no ckp needed
+    if optimizer is not None and len(optimizer.state) == 0:
+        _log("[CKP Probe] Warming up optimizer state (Adam m/v not yet allocated)...")
+        try:
+            _param_backup = [p.data.clone() for p in model.parameters() if p.requires_grad]
+            model.train()
+            _dummy_loss = sum(p.sum() for p in model.parameters() if p.requires_grad)
+            _dummy_loss.backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            for p, backup in zip((q for q in model.parameters() if q.requires_grad), _param_backup):
+                p.data.copy_(backup)
+            del _param_backup, _dummy_loss
+            torch.cuda.empty_cache()
+            _log("[CKP Probe] Optimizer state allocated.")
+        except Exception as _e:
+            _log(f"[CKP Probe] Optimizer warmup failed ({_e}), continuing without.")
+            model.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
 
-    # Step 2: try with full checkpointing
-    if not _try(True):
-        _log(f"[CKP Probe] OOM even with full ckp → falling back to config check_point")
-        return True  # let training handle it (will likely OOM, but that's the user's config)
+    table = {}
+    max_free_from_prev = horizon
 
-    # Step 3: binary search for max k such that _try(k) succeeds
-    # k=0 ≡ True (all ckp, known to succeed); k=horizon ≡ False (no ckp, known to fail)
-    lo, hi = 0, horizon - 1
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if _try(mid):
-            lo = mid
+    for h in range(horizon, 0, -1):
+        if _try(h, False):
+            table[h] = h
+            _log(f"[CKP Probe]   horizon={h}: no ckp needed (all {h} steps free)")
+            for hh in range(h - 1, 0, -1):
+                table[hh] = hh
+            _log(f"[CKP Probe]   horizon 1~{h-1}: no ckp needed (smaller than {h})")
+            break
+
+        if not _try(h, True):
+            table[h] = True
+            _log(f"[CKP Probe]   horizon={h}: OOM even with full ckp!")
+            continue
+
+        lo, hi = 0, min(h - 1, max_free_from_prev)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _try(h, mid):
+                lo = mid
+            else:
+                hi = mid - 1
+
+        safe_lo = max(0, lo - 1)
+        table[h] = safe_lo
+        max_free_from_prev = lo
+        _log(f"[CKP Probe]   horizon={h}: threshold={safe_lo} "
+             f"(steps [0,{safe_lo}) free, [{safe_lo},{h}) ckp)")
+
+    _log("[CKP Probe] Final table:")
+    for h in sorted(table.keys()):
+        v = table[h]
+        if v is True:
+            _log(f"  h={h}: FULL CKP (still OOM risk)")
+        elif v == h:
+            _log(f"  h={h}: no ckp")
         else:
-            hi = mid - 1
+            _log(f"  h={h}: threshold={v} ({v} free + {h - v} ckp)")
 
-    _log(f"[CKP Probe] ckpt_threshold={lo}: steps [0,{lo}) free, steps [{lo},{horizon}) use ckp")
-    return lo
+    return table
 
 
 # =============================================================================
@@ -850,21 +907,48 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
     if pf_enable:
         print(f"Pushforward: ON (start={pf_start}, extra_max={pf_extra_max}, ramp={pf_ramp})")
 
-    # ---- Adaptive checkpoint threshold ----
-    # Probe once with the first batch to find the max steps that fit without ckp.
-    # This overrides the config check_point for the entire training run.
+    # ---- Adaptive checkpoint threshold (per-horizon table) ----
     horizon_train = args.data.get("horizon_train", 1)
-    try:
-        _first_batch = next(iter(train_dataloader))
-        ckpt_threshold = _probe_ckpt_threshold(
-            model, _first_batch, device, horizon_train, args,
-            path_record=path_record, run_name=args.name
-        )
-        del _first_batch
-        torch.cuda.empty_cache()
-    except Exception as _probe_exc:
-        print(f"[CKP Probe] Probing failed ({_probe_exc}), falling back to config check_point.")
-        ckpt_threshold = None  # fall back to config
+    cfg_ckpt = args.train.get("check_point", False)
+    probe_horizon = horizon_train + (pf_extra_max if pf_enable else 0)
+    ckpt_table = None
+    if not cfg_ckpt:
+        print(f"[CKP] check_point disabled in config, skipping probe.")
+    else:
+        try:
+            _ds = train_dataloader.dataset
+            if hasattr(_ds, 'dataset'):
+                _ds = _ds.dataset
+            if hasattr(_ds, 'meta_cache') and hasattr(_ds, 'file_paths'):
+                _max_path = max(_ds.file_paths, key=lambda p: _ds.meta_cache[p]["node_pos"].shape[0])
+                _max_idx = next(i for i, (fid, _) in enumerate(_ds.sample_keys)
+                                if _ds.file_paths[fid] == _max_path)
+                print(f"[CKP Probe] Using largest-mesh sample (path={_max_path}, "
+                      f"N={_ds.meta_cache[_max_path]['node_pos'].shape[0]}) for probe.")
+                _first_batch = train_dataloader.collate_fn([_ds[_max_idx]])
+            else:
+                _first_batch = next(iter(train_dataloader))
+            ckpt_table = _probe_ckpt_threshold(
+                model, _first_batch, device, probe_horizon, args,
+                path_record=path_record, run_name=args.name,
+                optimizer=optimizer, normalizer=normalizer,
+            )
+            del _first_batch
+            torch.cuda.empty_cache()
+        except Exception as _probe_exc:
+            print(f"[CKP Probe] Probing failed ({_probe_exc}), falling back to config check_point.")
+            ckpt_table = None
+
+    def _get_ckpt_threshold(actual_horizon):
+        """Look up the optimal checkpoint threshold for a given rollout length."""
+        if ckpt_table is None:
+            return False if not cfg_ckpt else True
+        if actual_horizon in ckpt_table:
+            return ckpt_table[actual_horizon]
+        closest = min(ckpt_table.keys(), key=lambda h: (h < actual_horizon, abs(h - actual_horizon)))
+        if closest >= actual_horizon:
+            return ckpt_table[closest]
+        return ckpt_table.get(max(ckpt_table.keys()), True)
 
     # ---- Resume ----
     start_epoch, best_val_error = 0, float("inf")
@@ -896,7 +980,7 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         file.write(f"Pushforward: enable={pf_enable}\n")
         file.write(f"grad_loss_weight: {args.train.get('grad_loss_weight', 8.0)}\n")
         file.write(f"AMP: bf16 autocast (no GradScaler)\n")
-        file.write(f"ckpt_threshold: {ckpt_threshold} (horizon={horizon_train})\n")
+        file.write(f"ckpt_table: {ckpt_table} (probe_horizon={probe_horizon}, base={horizon_train})\n")
 
     # ---- Early-stop on repeated NaN/skip failures ----
     consecutive_skip_errors = 0
@@ -951,11 +1035,14 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         # Train
         try:
             if use_pushforward:
+                actual_horizon = horizon_train + pf_extra
+                ckpt_threshold = _get_ckpt_threshold(actual_horizon)
                 train_error = train_pushforward(
                     args, model, train_dataloader, optimizer, device, normalizer,
                     extra_steps=pf_extra, ema=ema, ckpt_threshold=ckpt_threshold
                 )
             else:
+                ckpt_threshold = _get_ckpt_threshold(horizon_train)
                 train_error = train_v2(
                     args, model, train_dataloader, optimizer, device, normalizer,
                     ema=ema, ckpt_threshold=ckpt_threshold
