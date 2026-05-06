@@ -258,3 +258,37 @@ def save_vtk_result(save_dir, epoch, file_id, predictions, ground_truths, node_p
             cloud.point_data[f"Err_{field}"] = np.abs(preds[t, :, i] - gts[t, :, i])
         cloud.save(os.path.join(sample_dir, f"step_{t:03d}.vtk"))
 
+def _resolve_model_path(load_path: str, model_name: str) -> str | None:
+    """
+    将 load_path 解析为一个具体的 .pt 文件路径，优先级：
+    1. load_path 本身是 .pt 文件 → 直接使用；
+    2. load_path 是目录 → 优先找 {model_name}_best.pt，否则找以 model_name 开头、
+       epoch 编号最大的检查点（文件名格式假定含 _epochN）；
+    3. 找不到 → 返回 None。
+    """
+    if load_path.endswith(".pt"):
+        return load_path if os.path.isfile(load_path) else None
+
+    if not os.path.isdir(load_path):
+        return None
+
+    # 优先：best 检查点
+    best = os.path.join(load_path, f"{model_name}_best.pt")
+    if os.path.exists(best):
+        return best
+
+    # 次选：找以 model_name 开头的所有 .pt，取 epoch 最大者
+    import re
+    candidates = [
+        f for f in os.listdir(load_path)
+        if f.startswith(model_name) and f.endswith(".pt")
+    ]
+    if not candidates:
+        return None
+
+    def _epoch_num(fname):
+        m = re.search(r"_(\d+)", fname)
+        return int(m.group(1)) if m else -1
+
+    best_candidate = max(candidates, key=_epoch_num)
+    return os.path.join(load_path, best_candidate)

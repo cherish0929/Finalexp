@@ -38,12 +38,50 @@ CONFIG_LIST = [
     "config/easypool/GraphViT_ep_s.json",
     "config/easypool/MGN_ep_s.json",
     "config/easypool/Transolver_ep_s.json",
-    "config/easypool_scale/ConvLSTM_ep_s.json",
-    "config/easypool_scale/FNO3D_ep_s.json",
-    "config/easypool_scale/MeltPoolResNet_sp_s.json",
-    "config/easypool_scale/ResNet3D_ep_s.json",
-    "config/easypool_scale/Unet3D_ep_s.json"
+    "config/basemodel/easypool/gtoattnres3_ep_s.json",
+    "config/basemodel/easypool/gto_ep_s.json"
+    # "config/easypool_scale/ConvLSTM_ep_s.json",
+    # "config/easypool_scale/FNO3D_ep_s.json",
+    # "config/easypool_scale/MeltPoolResNet_sp_s.json",
+    # "config/easypool_scale/ResNet3D_ep_s.json",
+    # "config/easypool_scale/Unet3D_ep_s.json"
 ]
+
+# CONFIG_LIST = [
+#     "config/easypool_scale/other_models/GTO_ep_scale_s.json",
+#     "config/easypool_scale/other_models/GTO_attnres_3_ep_scale_s.json",
+#     "config/easypool_scale/other_models/GNOT_ep_scale_s.json",
+#     "config/easypool_scale/other_models/GraphViT_ep_scale_s.json",
+#     "config/easypool_scale/other_models/MGN_ep_scale_s.json",
+#     "config/easypool_scale/other_models/Transolver_ep_scale_s.json",
+#     "config/easypool_scale/ConvLSTM_ep_s.json",
+#     "config/easypool_scale/FNO3D_ep_s.json",
+#     "config/easypool_scale/MeltPoolResNet_sp_s.json",
+#     "config/easypool_scale/ResNet3D_ep_s.json",
+#     "config/easypool_scale/Unet3D_ep_s.json"
+# ]
+
+CONFIG_LIST = [
+    # "config/keyhole_scale/other_models/GTO_kh_scale_s.json",
+    "config/keyhole_scale/other_models/GTO_attnres_3_kh_scale_s.json",
+    "config/keyhole_scale/other_models/GTO_attnres_3_kh_scale_s_v2.json",
+    # "config/keyhole_scale/other_models/GNOT_kh_scale_s.json",
+    # "config/keyhole_scale/other_models/GraphViT_kh_scale_s.json",
+    # "config/keyhole_scale/other_models/MGN_kh_scale_s.json",
+    # "config/keyhole_scale/other_models/Transolver_kh_scale_s.json",
+    # "config/keyhole_scale/ConvLSTM_kh_s.json",
+    # "config/keyhole_scale/FNO3D_kh_s.json",
+    # "config/keyhole_scale/MeltPoolResNet_kh_s.json",
+    # "config/keyhole_scale/ResNet3D_kh_s.json",
+    # "config/keyhole_scale/Unet3D_kh_s.json"
+]
+
+# CONFIG_LIST = [
+#     "config/keyhole_scale/other_models/GTO_attnres_3_kh_scale_s.json",
+#     "config/keyhole_scale/other_models/GNOT_kh_scale_s.json",
+#     # "config/keyhole_scale/other_models/Transolver_kh_scale_s.json",
+#     # "config/keyhole_scale/ConvLSTM_kh_s.json"
+# ]
 
 # ============================================================
 # DualLogger — 同时打印到终端和文件
@@ -81,7 +119,8 @@ def get_dataloader_eval(args, device_type):
     else:
         Datasetclass = AeroGtoDataset
 
-    args.data["test_list"], step = ["./data/con_ep/eval.txt"], 5
+    args.data["test_list"], step = ["./data/con_scale_kh/eval.txt"], 3
+    # args.data["test_list"], step = ["./data/con_scale_kh/eval.txt"], 3
     args.data["test"]["batchsize"] = 1
 
     train_dataset = Datasetclass(args=args, mode="train")
@@ -95,7 +134,7 @@ def get_dataloader_eval(args, device_type):
 
     # 使用 1/4 测试集加速
     subset_size = max(1, len(test_dataset) // step)
-    indices = list(range(0, len(test_dataset), 4))[:subset_size]
+    indices = list(range(0, len(test_dataset), step))[:subset_size]
     test_dataset = Subset(test_dataset, indices)
 
     pin_memory = "cuda" in device_type
@@ -499,7 +538,7 @@ def main():
     device = torch.device(device_str)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = f"evaluate/report_{timestamp}.txt"
+    report_path = f"evaluate/final/report_keyhole_no_scale_2{timestamp}.txt"
     logger = DualLogger(report_path)
 
     logger.log(f"{'#'*70}")

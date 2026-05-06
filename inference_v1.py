@@ -157,7 +157,7 @@ class AeroGtoPredictor:
         state_0 = state_seq[:, 0] 
         gt_seq = state_seq[:, 1:]
 
-        print(f"[Predict] Running autoregressive inference...")
+        # print(f"[Predict] Running autoregressive inference...")
         with torch.no_grad():
             if use_amp:
                 with autocast("cuda", dtype=torch.bfloat16):

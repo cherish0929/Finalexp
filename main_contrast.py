@@ -25,6 +25,8 @@ import copy
 import math
 import traceback
 import sys
+import json
+import hashlib
 from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
@@ -36,7 +38,7 @@ from torch.optim import AdamW
 
 from src.dataset import AeroGtoDataset, CutAeroGtoDataset, ShapeGroupedSampler
 from src.train import train, validate, get_train_loss, _init_region_agg, _accumulate_region, _finalize_region
-from src.utils import set_seed, init_weights, parse_args, load_json_config
+from src.utils import set_seed, init_weights, parse_args, load_json_config, _resolve_model_path
 from src.model import build_model, GRID_MODELS
 
 
@@ -498,6 +500,122 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
 # Adaptive checkpoint threshold probing  (per-horizon table, synced from main_v2)
 # =============================================================================
 
+def _compute_probe_cache_key(args, max_node_count, device):
+    """构建 probe 缓存键。返回 (16字符 sha256 哈希, key_inputs dict)。
+
+    决定性输入：模型架构、bs、horizon、pushforward、AMP、最大网格、GPU、torch 版本。
+    剔除 load_path（不影响显存占用）。
+    """
+    model_cfg = dict(args.model) if isinstance(args.model, dict) else dict(vars(args.model))
+    model_cfg.pop("load_path", None)
+
+    pf_cfg = args.train.get("pushforward", {"enable": False}) if isinstance(args.train, dict) else {}
+    data_cfg = args.data if isinstance(args.data, dict) else {}
+    train_cfg = data_cfg.get("train", {}) if isinstance(data_cfg, dict) else {}
+
+    try:
+        gpu_name = torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu"
+    except Exception:
+        gpu_name = "unknown"
+
+    key_inputs = {
+        "model_cfg": model_cfg,
+        "batchsize": train_cfg.get("batchsize", 1),
+        "horizon_train": data_cfg.get("horizon_train", 1),
+        "pf_enable": bool(pf_cfg.get("enable", False)),
+        "pf_extra_max": int(pf_cfg.get("extra_steps", 0)),
+        "use_amp": bool(args.train.get("use_amp", False)) if isinstance(args.train, dict) else False,
+        "max_node_count": int(max_node_count),
+        "gpu_name": gpu_name,
+        "torch_version": torch.__version__,
+    }
+    blob = json.dumps(key_inputs, sort_keys=True, default=str)
+    cache_key = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+    return cache_key, key_inputs
+
+
+def _ckpt_table_to_json(table):
+    """ckpt_table 序列化：int key → str；保留 True/False/int value。"""
+    return {str(h): v for h, v in table.items()}
+
+
+def _ckpt_table_from_json(obj):
+    """ckpt_table 反序列化：str key → int；保留 True/False/int value（json 已天然区分）。"""
+    return {int(h): v for h, v in obj.items()}
+
+
+def _format_ckpt_table(table):
+    """格式化 per-horizon 表为多行字符串（与 _probe 内部输出格式一致）。"""
+    lines = []
+    for h in sorted(table.keys()):
+        v = table[h]
+        if v is True:
+            lines.append(f"  h={h}: FULL CKP (still OOM risk)")
+        elif v == h:
+            lines.append(f"  h={h}: no ckp")
+        else:
+            lines.append(f"  h={h}: threshold={v} ({v} free + {h - v} ckp)")
+    return "\n".join(lines)
+
+
+def _diff_key_inputs(old, new):
+    """返回 old 与 new 中字段差异的可读字符串，用于解释 cache MISS 原因。"""
+    diffs = []
+    keys = set(old.keys()) | set(new.keys())
+    for k in sorted(keys):
+        ov, nv = old.get(k, "<absent>"), new.get(k, "<absent>")
+        if ov != nv:
+            if k == "model_cfg" and isinstance(ov, dict) and isinstance(nv, dict):
+                sub = sorted(set(ov.keys()) | set(nv.keys()))
+                sub_diffs = [f"{sk}: {ov.get(sk)!r} → {nv.get(sk)!r}"
+                             for sk in sub if ov.get(sk) != nv.get(sk)]
+                if sub_diffs:
+                    diffs.append("model_cfg{ " + ", ".join(sub_diffs) + " }")
+            else:
+                diffs.append(f"{k}: {ov!r} → {nv!r}")
+    return "; ".join(diffs) if diffs else "(no field-level diff, hash collision?)"
+
+
+def _load_probe_cache(cache_path, expected_key):
+    """读取 cache 文件。命中返回 (ckpt_table, key_inputs)；miss/损坏返回 (None, old_key_inputs_or_None)。"""
+    if not os.path.exists(cache_path):
+        return None, None
+    try:
+        with open(cache_path, "r") as f:
+            data = json.load(f)
+        if data.get("version") != 1:
+            return None, data.get("key_inputs")
+        if data.get("key") != expected_key:
+            return None, data.get("key_inputs")
+        return _ckpt_table_from_json(data["ckpt_table"]), data.get("key_inputs")
+    except (json.JSONDecodeError, KeyError, TypeError, OSError) as e:
+        print(f"[CKP Cache] Corrupted cache file ({e}), will re-probe.")
+        try:
+            os.remove(cache_path)
+        except OSError:
+            pass
+        return None, None
+
+
+def _save_probe_cache(cache_path, cache_key, key_inputs, ckpt_table):
+    """原子写入 cache 文件（先写 .tmp 再 rename）。失败仅打印 warning。"""
+    payload = {
+        "version": 1,
+        "key": cache_key,
+        "key_inputs": key_inputs,
+        "ckpt_table": _ckpt_table_to_json(ckpt_table),
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        tmp_path = cache_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+        os.replace(tmp_path, cache_path)
+    except OSError as e:
+        print(f"[CKP Cache] Warning: failed to save cache ({e})")
+
+
 def _probe_ckpt_threshold(model, first_batch, device, horizon, args,
                           path_record="", run_name="", optimizer=None, normalizer=None):
     """
@@ -525,21 +643,23 @@ def _probe_ckpt_threshold(model, first_batch, device, horizon, args,
     model_name = args.model.get("name", "PhysGTO")
     _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max")
 
-    dt = first_batch['dt'][:1].to(device)
-    state_full = first_batch["state"][:1, :horizon + 1].to(device)
-    node_pos = first_batch["node_pos"][:1].to(device)
-    edges = first_batch["edges"][:1].to(device)
-    time_seq_full = first_batch["time_seq"][:1, :horizon].to(device)
-    conditions = first_batch["conditions"][:1].to(device).float()
+    # Use the full incoming batch so probe memory matches actual training batch size.
+    # Caller is expected to size first_batch to the training bs (heaviest mesh).
+    dt = first_batch['dt'].to(device)
+    state_full = first_batch["state"][:, :horizon + 1].to(device)
+    node_pos = first_batch["node_pos"].to(device)
+    edges = first_batch["edges"].to(device)
+    time_seq_full = first_batch["time_seq"][:, :horizon].to(device)
+    conditions = first_batch["conditions"].to(device).float()
     spatial_inform = None
     if _use_spatial and "spatial_inform" in first_batch:
-        spatial_inform = first_batch["spatial_inform"][:1].to(device)
+        spatial_inform = first_batch["spatial_inform"].to(device)
 
     fields = args.data.get("fields", ["T"])
     weight_loss = args.train.get("weight_loss", {"enable": False})
     if weight_loss.get("gradient", False) and "grid_shape" in first_batch:
         weight_loss = dict(weight_loss)
-        weight_loss["grid_shape"] = first_batch["grid_shape"][:1].numpy()
+        weight_loss["grid_shape"] = first_batch["grid_shape"].numpy()
 
     normalizer_ref = normalizer
 
@@ -692,13 +812,20 @@ def _sample_node_count(base_dataset, sample_idx: int) -> int:
     return base_dataset.meta_cache[path]["node_pos"].shape[0]
 
 
-class GridGroupedBatchSampler(Sampler):
-    """按节点数（grid 形状）分组的 BatchSampler。
+def _sample_ds_shape(base_dataset, sample_idx: int) -> tuple:
+    """O(1) 取样本 ds_shape：用作梯度损失要求的精确网格形状分桶键。"""
+    file_id, _ = base_dataset.sample_keys[sample_idx]
+    path = base_dataset.file_paths[file_id]
+    return tuple(base_dataset.meta_cache[path]["ds_shape"])
 
-    Why: easypool 数据集中不同 HDF5 文件的网格形状不同，导致样本节点数不一致，
+
+class GridGroupedBatchSampler(Sampler):
+    """按 ds_shape（三维网格分辨率）分组的 BatchSampler。
+
+    Why: 不同 HDF5 文件的下采样网格形状 (Nx, Ny, Nz) 不同，导致节点数不一致，
     PyTorch 默认 collate 在 batchsize>1 时无法 stack 变长 tensor。
-    本采样器保证同一 batch 内的样本节点数一致，从而绕过 collate 的 stack 限制，
-    且不引入 padding（不会污染 loss / 指标）。
+    分桶键使用 ds_shape 而非节点总数，是因为梯度损失 compute_spatial_gradient_3d
+    要求同一 batch 内三维分辨率完全相同（节点总数相同但形状不同仍会报错）。
 
     drop_last=False 时若某组余样本数 < batch_size，会形成一个小 batch（与默认行为一致）。
     """
@@ -711,11 +838,12 @@ class GridGroupedBatchSampler(Sampler):
         self.drop_last = bool(drop_last)
 
         base, idx_map = _resolve_dataset_for_grouping(dataset)
-        # 按节点数分组：{node_num: [dataloader 用的下标列表]}
+        # 按 ds_shape 分组：确保同 batch 内网格形状完全相同（梯度损失要求）
+        # 注意：仅按节点总数分组不够，相同节点数可能有不同形状（如 8×10×12 vs 6×10×16）
         groups: dict = {}
         for i, parent_idx in enumerate(idx_map):
-            n = _sample_node_count(base, parent_idx)
-            groups.setdefault(n, []).append(i)
+            key = _sample_ds_shape(base, parent_idx)
+            groups.setdefault(key, []).append(i)
         self._groups = groups
         self._epoch = 0
 
@@ -857,7 +985,7 @@ def get_dataloader(args, path_record, device_type, pf_extra_max=0):
         file.write(f"Grid shape: {grid_shape}\n")
         file.write(f"Mean dt: {train_dataset.dt:.4e}\n")
         n_buckets = len(train_dataloader.batch_sampler._groups)
-        file.write(f"GridGroupedBatchSampler: {n_buckets} node-count buckets, train_bs={data_cfg['train'].get('batchsize', 1)}\n")
+        file.write(f"GridGroupedBatchSampler: {n_buckets} ds_shape buckets, train_bs={data_cfg['train'].get('batchsize', 1)}\n")
 
     return train_dataloader, test_dataloader, train_dataset.normalizer, cond_dim, train_dataset.dt, grid_shape
 
@@ -880,12 +1008,24 @@ def get_model(args, device, cond_dim, default_dt, grid_shape):
     checkpoint = None
 
     if load_path:
-        model_path = os.path.join(load_path, f"{args.name}_best.pt")
-        if os.path.exists(model_path):
-            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-            state_dict = checkpoint.get("state_dict", checkpoint)
-            model.load_state_dict(state_dict, strict=False)
-            print(f"Loaded model from {model_path}")
+        resolved_path = _resolve_model_path(load_path, args.name)
+        if resolved_path and os.path.exists(resolved_path):
+            try:
+                checkpoint = torch.load(resolved_path, map_location=device, weights_only=False)
+                state_dict = checkpoint.get("state_dict", checkpoint)
+                model.load_state_dict(state_dict, strict=False)
+                print(f"Loaded model from {resolved_path}")
+            except Exception as e:
+                # 文件损坏（如保存中断）时降级为随机初始化
+                print(f"Warning: failed to load checkpoint {resolved_path!r}: {e}")
+                print("Falling back to random initialization.")
+                checkpoint = None
+                if model_cfg.get("if_init", True):
+                    model.apply(init_weights)
+        else:
+            print(f"Warning: no checkpoint found for load_path={load_path!r}, training from scratch")
+            if model_cfg.get("if_init", True):
+                model.apply(init_weights)
     elif model_cfg.get("if_init", True):
         model.apply(init_weights)
 
@@ -898,6 +1038,7 @@ def get_model(args, device, cond_dim, default_dt, grid_shape):
 
 def main(args, path_logs, path_nn, path_record, config_path=""):
     device_str = args.device
+    data_cfg = args.data
     if "cuda" in device_str and not torch.cuda.is_available():
         print("! Warning: CUDA not available, using CPU")
         device_str = "cpu"
@@ -981,22 +1122,65 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
             _ds = train_dataloader.dataset
             if hasattr(_ds, 'dataset'):
                 _ds = _ds.dataset
+            # Probe must use the actual training batch size — single-sample probe
+            # underestimates memory usage and yields too-optimistic thresholds for bs>1,
+            # causing repeated OOM fallback during training.
+            _train_bs = data_cfg['train'].get("batchsize", 1) if isinstance(data_cfg, dict) else 1
+
+            # Determine max mesh size up-front (also used as cache key component)
+            _max_node_count = 0
             if hasattr(_ds, 'meta_cache') and hasattr(_ds, 'file_paths'):
                 _max_path = max(_ds.file_paths, key=lambda p: _ds.meta_cache[p]["node_pos"].shape[0])
-                _max_idx = next(i for i, (fid, _) in enumerate(_ds.sample_keys)
-                                if _ds.file_paths[fid] == _max_path)
-                print(f"[CKP Probe] Using largest-mesh sample (path={_max_path}, "
-                      f"N={_ds.meta_cache[_max_path]['node_pos'].shape[0]}) for probe.")
-                _first_batch = train_dataloader.collate_fn([_ds[_max_idx]])
+                _max_node_count = _ds.meta_cache[_max_path]["node_pos"].shape[0]
+
+            # ---- Try cache hit before running the expensive probe ----
+            _cache_path = f"{path_record}/{args.name}_ckpt_probe_cache.json"
+            _cache_key, _key_inputs = _compute_probe_cache_key(args, _max_node_count, device)
+            _cached_table, _old_key_inputs = _load_probe_cache(_cache_path, _cache_key)
+
+            if _cached_table is not None:
+                ckpt_table = _cached_table
+                _hit_msg = (f"[CKP Cache] HIT (key={_cache_key}, "
+                            f"file={_cache_path})\n[CKP Cache] Cached per-horizon table:\n"
+                            f"{_format_ckpt_table(ckpt_table)}")
+                print(_hit_msg)
+                try:
+                    with open(f"{path_record}/{args.name}_training_log.txt", "a") as _f:
+                        _f.write(_hit_msg + "\n")
+                except OSError:
+                    pass
             else:
-                _first_batch = next(iter(train_dataloader))
-            ckpt_table = _probe_ckpt_threshold(
-                model, _first_batch, device, probe_horizon, args,
-                path_record=path_record, run_name=args.name,
-                optimizer=optimizer, normalizer=normalizer,
-            )
-            del _first_batch
-            torch.cuda.empty_cache()
+                if _old_key_inputs is not None:
+                    print(f"[CKP Cache] MISS (cache key changed: "
+                          f"{_diff_key_inputs(_old_key_inputs, _key_inputs)}), re-probing.")
+                else:
+                    print(f"[CKP Cache] MISS (no cache at {_cache_path}), probing fresh.")
+
+                if hasattr(_ds, 'meta_cache') and hasattr(_ds, 'file_paths'):
+                    # Collect up to _train_bs sample indices that share the largest mesh,
+                    # so the probe batch matches the heaviest training batch.
+                    _max_indices = [i for i, (fid, _) in enumerate(_ds.sample_keys)
+                                    if _ds.file_paths[fid] == _max_path][:_train_bs]
+                    if not _max_indices:
+                        _max_indices = [next(i for i, (fid, _) in enumerate(_ds.sample_keys)
+                                              if _ds.file_paths[fid] == _max_path)]
+                    print(f"[CKP Probe] Using largest-mesh sample (path={_max_path}, "
+                          f"N={_max_node_count}, probe_bs={len(_max_indices)}) for probe.")
+                    _first_batch = train_dataloader.collate_fn([_ds[i] for i in _max_indices])
+                else:
+                    _first_batch = next(iter(train_dataloader))
+                ckpt_table = _probe_ckpt_threshold(
+                    model, _first_batch, device, probe_horizon, args,
+                    path_record=path_record, run_name=args.name,
+                    optimizer=optimizer, normalizer=normalizer,
+                )
+                del _first_batch
+                torch.cuda.empty_cache()
+
+                # Persist for future runs
+                if ckpt_table is not None:
+                    _save_probe_cache(_cache_path, _cache_key, _key_inputs, ckpt_table)
+                    print(f"[CKP Cache] Saved to {_cache_path}")
         except Exception as _probe_exc:
             print(f"[CKP Probe] Probing failed ({_probe_exc}), falling back to config check_point.")
             ckpt_table = None
