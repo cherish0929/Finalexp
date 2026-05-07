@@ -273,8 +273,16 @@ class AeroGtoDataset(Dataset):
         self.time_ref = 2e-5 if self.config.get("dt_scale", False) else 1
         self.edge_sample_ratio = self.config.get("edge_sample_ratio", 1.0)
 
-        for file_id, path in enumerate(self.file_paths):
-            meta = self._build_meta(path)
+        valid_paths = []
+        for path in self.file_paths:
+            try:
+                meta = self._build_meta(path)
+            except OSError as e:
+                print(f"[WARNING] 跳过损坏的 HDF5 文件: {path}\n  原因: {e}")
+                continue
+
+            file_id = len(valid_paths)
+            valid_paths.append(path)
             self.meta_cache[path] = meta
             self.max_start_per_file.append(meta["max_start"])
 
@@ -285,6 +293,14 @@ class AeroGtoDataset(Dataset):
                 step = max(1, self.horizon // 2)
                 for start in range(1, meta["max_start"] + 1, step):
                     self.sample_keys.append((file_id, start))
+
+        skipped = len(self.file_paths) - len(valid_paths)
+        self.file_paths = valid_paths
+        if skipped > 0:
+            print(f"[WARNING] 共跳过 {skipped} 个损坏文件，"
+                  f"有效文件 {len(valid_paths)}/{len(valid_paths) + skipped}")
+        if len(valid_paths) == 0:
+            raise RuntimeError("所有 HDF5 文件均损坏，无法创建数据集")
 
         example_meta = next(iter(self.meta_cache.values()))
         self.cond_dim = example_meta["conditions"].shape[-1]
@@ -436,10 +452,18 @@ class AeroGtoDataset(Dataset):
         with h5py.File(path, "r") as f:
             time_idx = start + np.arange(0, self.horizon + self.pf_extra + 1) * self.time_stride
             channels = []
+            air_data_all_points = f["state/alpha.air"][time_idx]
+            air_data_d = air_data_all_points[:, indices, 0]
             for fname in self.fields:
-                fkey = f"state/{fname}"
-                data_all_points = f[fkey][time_idx]
-                d = data_all_points[:, indices, 0]
+                if fname == "gamma_liquid":
+                    data_all_points = f["state/gamma_liquid"][time_idx]
+                    d = data_all_points[:, indices, 0] * (1 - air_data_d)
+                elif fname == "alpha.air":
+                    d = air_data_d
+                else:
+                    fkey = f"state/{fname}"
+                    data_all_points = f[fkey][time_idx]
+                    d = data_all_points[:, indices, 0]
                 channels.append(d)
             state = np.stack(channels, axis=-1).astype(np.float32)
             time_all = f["time"][time_idx]

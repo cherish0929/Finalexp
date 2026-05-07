@@ -4,12 +4,11 @@ PhysGTO-AttnRes-Max: Bi-Conditioned Cross-Attention + 8-SubLayer Block + Intra-B
 在 physgto_attnres_multi_v3.py 基础上进行的定向重构：
 
 1. BiCondFieldCrossAttention（升级版 FieldCrossAttention）
-   - 动态 query：Q_base + self_summary_offset + other_summary_offset + pair_summary_offset
+   - 动态 query：Q_base + self_summary_offset + other_summary_offset
    - query 做 LayerNorm 保证稳定性
-   - V_other 被 V_self 条件化门控（self-aware cross reading）
+   - 多场: 复用 v3 concat 策略，直接拼接所有 other field 节点，一次 cross-attn，无信息瓶颈
    - n_latent 层 latent refinement (self-attn + FFN + pre-norm + gated residual)
    - 输出阶段 gated residual fusion（layer_scale × sigmoid gate）
-   - 多场: 每个 other field 独立 token 压缩 → concat → self-attn 融合
 
 2. 扩充 AttnResMixerBlock → 8 子层
    GNN_encode → Intra_attn → GNN_mid → Cross_attn → GNN_post → Post_attn → GNN_light → FFN
@@ -433,16 +432,14 @@ class BiCondFieldCrossAttention(nn.Module):
     """
     Bi-Conditioned Projection Cross-Field Attention
 
-    相比旧版 FieldCrossAttention 的改进：
-    1. 动态 query 生成：Q = Q_base + Δ_self + Δ_other + Δ_pair
-       - self_summary   = mean_pool(V_self)     → linear → Δ_self
-       - other_summary  = mean_pool(V_other_gated) → linear → Δ_other
-       - pair_summary   = mean(V_self * V_other) → linear → Δ_pair  (仅用前 V_other，多场时用 V_others[0] 做对)
-       - Q = LayerNorm(Q_base + Δ_self + Δ_other + Δ_pair)
-    2. V_other 被 V_self 门控（self-aware）：gated_other = V_other * sigmoid(self_gate_proj(V_self))
-    3. 多场融合：每个 other field 独立提取 n_token token → concat → 1 层 self-attn 融合
-    4. n_latent 层 latent refinement（LatentRefineLayer: pre-norm + gated residual）
-    5. 输出：V_self attend to refined tokens → gated residual fusion
+    设计原则：
+    1. 动态 query 生成：Q = LayerNorm(Q_base + Δ_self + Δ_other)
+       - self_summary  = mean_pool(V_self)          → linear → Δ_self
+       - other_summary = mean_pool(V_others_concat) → linear → Δ_other
+    2. 多场融合：复用 v3 的 concat 策略，直接将所有 other field 节点拼接
+       [bs, (n_fields-1)*N, enc_dim]，Q 一次性 attend，无信息瓶颈
+    3. n_latent 层 latent refinement（LatentRefineLayer: pre-norm + gated residual）
+    4. 输出：V_self attend to refined tokens → gated residual fusion
 
     复杂度：O(N × n_token)，非 O(N²)
 
@@ -464,32 +461,13 @@ class BiCondFieldCrossAttention(nn.Module):
         self.Q_base = nn.Parameter(torch.empty(n_token, enc_dim))
         nn.init.xavier_uniform_(self.Q_base)
 
-        # Query offsets（各 summary → enc_dim）
-        self.q_self_proj   = nn.Linear(enc_dim, enc_dim)
-        self.q_other_proj  = nn.Linear(enc_dim, enc_dim)
-        self.q_pair_proj   = nn.Linear(enc_dim, enc_dim)
-        self.q_ln          = nn.LayerNorm(enc_dim)
+        # Query offsets（self/other summary → enc_dim）
+        self.q_self_proj  = nn.Linear(enc_dim, enc_dim)
+        self.q_other_proj = nn.Linear(enc_dim, enc_dim)
+        self.q_ln         = nn.LayerNorm(enc_dim)
 
-        # V_other 门控（self-aware）：每个 other field 一个门控
-        self.self_gate_projs = nn.ModuleList([
-            nn.Linear(enc_dim, enc_dim) for _ in range(n_other_fields)
-        ])
-
-        # 每个 other field 的 cross-attn（Q attend to V_other）
-        self.per_field_cross_attns = nn.ModuleList([
-            nn.MultiheadAttention(enc_dim, n_heads, batch_first=True)
-            for _ in range(n_other_fields)
-        ])
-
-        # 多场 token 融合（仅当 n_other_fields > 1，concat → self-attn）
-        if n_other_fields > 1:
-            self.token_fusion_attn = nn.MultiheadAttention(enc_dim, n_heads, batch_first=True)
-            self.token_fusion_norm = nn.LayerNorm(enc_dim)
-            # 将 n_other_fields * n_token → n_token 的映射（Query = learnable tokens）
-            self.token_compress_Q = nn.Parameter(torch.empty(n_token, enc_dim))
-            nn.init.xavier_uniform_(self.token_compress_Q)
-        else:
-            self.token_fusion_attn = None
+        # 单次 cross-attn：Q attend to 所有 other field 节点（v3 concat 策略）
+        self.cross_attn = nn.MultiheadAttention(enc_dim, n_heads, batch_first=True)
 
         # Latent refinement layers
         self.latent_layers = nn.ModuleList([
@@ -504,11 +482,6 @@ class BiCondFieldCrossAttention(nn.Module):
         # Gated residual fusion（输出阶段）
         self.out_gated_res = GatedResidual(enc_dim, layer_scale_init)
 
-    def _gated_other(self, V_self, V_other, gate_proj):
-        """V_other 被 V_self 条件化门控"""
-        gate = torch.sigmoid(gate_proj(V_self))    # [bs, N, enc_dim]
-        return V_other * gate
-
     def forward(self, V_self, V_others_list):
         """
         Args:
@@ -520,40 +493,24 @@ class BiCondFieldCrossAttention(nn.Module):
         """
         bs = V_self.shape[0]
 
-        # ---- Step 1: 动态 query 生成 ----
-        # self_summary: [bs, 1, enc_dim]
-        self_summary = V_self.mean(dim=1, keepdim=True)
-
-        # other_summary: 使用第一个 other field（门控后）做对，计算 pair_summary
-        gated_v0 = self._gated_other(V_self, V_others_list[0], self.self_gate_projs[0])
-        other_summary = gated_v0.mean(dim=1, keepdim=True)
-        pair_summary  = (V_self * gated_v0).mean(dim=1, keepdim=True)
-
-        # Query = Q_base + offsets，再 LayerNorm
-        Q = self.Q_base.unsqueeze(0).expand(bs, -1, -1)          # [bs, n_token, enc_dim]
-        Q = Q + self.q_self_proj(self_summary)                    # broadcast over n_token
-        Q = Q + self.q_other_proj(other_summary)
-        Q = Q + self.q_pair_proj(pair_summary)
-        Q = self.q_ln(Q)                                          # LayerNorm 稳定注意力
-
-        # ---- Step 2: 每个 other field 独立提取 tokens ----
-        per_field_tokens = []
-        for k, (V_other, gate_proj, cross_attn) in enumerate(
-            zip(V_others_list, self.self_gate_projs, self.per_field_cross_attns)
-        ):
-            gated_other = self._gated_other(V_self, V_other, gate_proj)  # self-aware
-            tokens_k, _ = cross_attn(Q, gated_other, gated_other)        # [bs, n_token, enc_dim]
-            per_field_tokens.append(tokens_k)
-
-        # ---- Step 3: 多场 token 融合 ----
-        if self.token_fusion_attn is not None and len(per_field_tokens) > 1:
-            # concat: [bs, n_other_fields * n_token, enc_dim]
-            tokens_concat = torch.cat(per_field_tokens, dim=1)
-            tokens_concat = self.token_fusion_norm(tokens_concat)
-            compress_Q = self.token_compress_Q.unsqueeze(0).expand(bs, -1, -1)
-            tokens, _ = self.token_fusion_attn(compress_Q, tokens_concat, tokens_concat)
+        # ---- Step 1: 多场 concat（v3 策略，无信息瓶颈）----
+        # V_others: [bs, (n_fields-1)*N, enc_dim]
+        if len(V_others_list) == 1:
+            V_others = V_others_list[0]
         else:
-            tokens = per_field_tokens[0]  # [bs, n_token, enc_dim]
+            V_others = torch.cat(V_others_list, dim=1)
+
+        # ---- Step 2: 动态 query 生成 ----
+        self_summary  = V_self.mean(dim=1, keepdim=True)       # [bs, 1, enc_dim]
+        other_summary = V_others.mean(dim=1, keepdim=True)     # [bs, 1, enc_dim]
+
+        Q = self.Q_base.unsqueeze(0).expand(bs, -1, -1)        # [bs, n_token, enc_dim]
+        Q = Q + self.q_self_proj(self_summary)                  # broadcast over n_token
+        Q = Q + self.q_other_proj(other_summary)
+        Q = self.q_ln(Q)                                        # LayerNorm 稳定注意力
+
+        # ---- Step 3: Q attend to 所有 other field 节点（一次性，无瓶颈）----
+        tokens, _ = self.cross_attn(Q, V_others, V_others)     # [bs, n_token, enc_dim]
 
         # ---- Step 4: Latent refinement（multi-layer self-attn + FFN） ----
         for layer in self.latent_layers:

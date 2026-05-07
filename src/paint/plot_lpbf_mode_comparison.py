@@ -4,25 +4,16 @@ plot_lpbf_mode_comparison.py
 Generates a 2xN academic-style figure comparing cross-sectional field snapshots
 from two LPBF simulation modes (conduction vs. keyhole) at aligned physical times.
 
-Overlays on each panel:
-  - alpha.air = 0.5 contour (air-metal interface, white dashed)
-  - gamma_liquid * (1 - alpha.air) = 0.5 contour (melt-pool boundary, gold solid)
+Overlays on each panel (restricted to the active / metal region):
+  - gamma_liquid = 0.5 contour, clipped to y < 1e-4 m  (solid-liquid boundary)
+  - alpha.air = 0.5 contour, active region only        (liquid-gas boundary)
 
 Usage example (edit the CONFIG block below, then run):
     python plot_lpbf_mode_comparison.py
-
-Or via command line:
-    python plot_lpbf_mode_comparison.py \
-        --conduction /path/to/conduction.h5 \
-        --keyhole    /path/to/keyhole.h5 \
-        --field      alpha.air \
-        --z_slice    5e-4 \
-        --times      0.0 2e-5 4e-5 6e-5 8e-5 1e-4 \
-        --output_dir ./output
 """
 
 # ============================================================
-# CONFIG — edit here when running without CLI arguments
+# CONFIG
 # ============================================================
 conduction_list = [
     "/home/ubuntu/MyAI/datasets/collectdata/easypool/easy/04_P80_E75_I5.h5",
@@ -32,16 +23,15 @@ keyhole_list = [
     "/home/ubuntu/MyAI/datasets/collectdata/keyhole/keyhole/03_P210_E75_I1.h5",
     "/home/ubuntu/MyAI/datasets/collectdata/keyhole/keyhole/04_P215_E75_I2.h5"
 ]
-CONDUCTION_H5 = conduction_list[1]
+CONDUCTION_H5 = conduction_list[0]
 KEYHOLE_H5    = keyhole_list[1]
-FIELD_NAME    = "alpha.air"          # "T", "alpha.air", "alpha.titanium", "gamma_liquid", ...
-Z_SLICE       = 5e-4                 # target z coordinate (metres)
+FIELD_NAME    = "alpha.air"
+Z_SLICE       = 5e-4
 SELECTED_TIMES = [15e-5, 30e-5, 45e-5, 60e-5]
 OUTPUT_DIR    = "src/paint/result"
 # ============================================================
 
 import argparse
-import os
 import sys
 import warnings
 from pathlib import Path
@@ -73,32 +63,23 @@ def _list_state_fields(f: h5py.File) -> List[str]:
 
 
 def _read_meta(h5_path: str) -> Dict:
-    """Read grid metadata from an HDF5 file."""
     with h5py.File(h5_path, "r") as f:
         block = f["mesh/block"][0].astype(int)
-        bounds = f["mesh/bounds"][:].astype(np.float32)   # [3, 2]
-        points = f["point"][:].astype(np.float32)          # [N, 3]
+        bounds = f["mesh/bounds"][:].astype(np.float32)
+        points = f["point"][:].astype(np.float32)
         time_arr = f["time"][:].astype(np.float64)
-
         grid_shape = (int(block[0]) + 1, int(block[1]) + 1, int(block[2]) + 1)
-
         available_fields = _list_state_fields(f)
-
     return {
-        "grid_shape": grid_shape,   # (nx, ny, nz)
+        "grid_shape": grid_shape,
         "bounds": bounds,
-        "points": points,           # [N, 3]  columns: x, y, z
+        "points": points,
         "time": time_arr,
         "available_fields": available_fields,
     }
 
 
 def _find_z_layer(points: np.ndarray, z_target: float) -> Tuple[np.ndarray, float]:
-    """
-    Return boolean mask of points whose z is closest to z_target,
-    and the actual z value selected.
-    Uses float32-safe tolerance to avoid NaN gaps from precision mismatch.
-    """
     z_vals = points[:, 2]
     unique_z = np.unique(z_vals)
     best_z = unique_z[np.argmin(np.abs(unique_z - z_target))]
@@ -108,7 +89,6 @@ def _find_z_layer(points: np.ndarray, z_target: float) -> Tuple[np.ndarray, floa
 
 
 def _find_time_indices(time_arr: np.ndarray, target_times: List[float]) -> List[int]:
-    """For each target time, return the index of the closest entry in time_arr."""
     indices = []
     for t in target_times:
         idx = int(np.argmin(np.abs(time_arr - t)))
@@ -118,29 +98,20 @@ def _find_time_indices(time_arr: np.ndarray, target_times: List[float]) -> List[
 
 
 def _interp_grid(pts_x, pts_y, vals, Xi, Yi, method="linear"):
-    """Interpolate scatter values onto a regular grid, with nearest-fill fallback."""
     if vals is None:
         return None
     points = np.column_stack([pts_x, pts_y])
     values = np.asarray(vals)
-
-    interp_try = [method]
-    if method != "linear":
-        interp_try.append("linear")
-    interp_try.append("nearest")
-
     Z = None
-    for m in interp_try:
+    for m in ([method] + (["linear"] if method != "linear" else []) + ["nearest"]):
         try:
             Z = griddata(points, values, (Xi, Yi), method=m)
         except Exception:
             Z = None
         if Z is not None and not np.all(np.isnan(Z)):
             break
-
     if Z is None:
         return None
-
     if np.isnan(Z).any():
         try:
             Z_nearest = griddata(points, values, (Xi, Yi), method="nearest")
@@ -151,7 +122,6 @@ def _interp_grid(pts_x, pts_y, vals, Xi, Yi, method="linear"):
 
 
 def _smooth_for_plot(Z, sigma):
-    """Apply Gaussian smoothing, preserving NaN regions."""
     if Z is None or sigma is None or sigma <= 0:
         return Z
     if np.all(np.isnan(Z)):
@@ -166,80 +136,22 @@ def _smooth_for_plot(Z, sigma):
     return Z_smooth
 
 
-def _contour_outlined(ax, X, Y, Z, levels, color, lw, ls='-', zorder=5):
-    """
-    Draw contours with a black outline for visibility on any colormap background.
-    First pass: thicker black line (outline).  Second pass: coloured core line.
-    """
+# ------------------------------------------------------------------
+# Contour drawing utilities
+# ------------------------------------------------------------------
+
+def _contour_outlined(ax, X, Y, Z, levels, color, lw, ls='-', zorder=5,
+                      outline_color='black', outline_lw=None):
+    """Draw a contour with a black outline for visibility against colormaps."""
+    if outline_lw is None:
+        outline_lw = lw + 1.0
     ax.contour(X, Y, Z, levels=levels,
-               colors='black', linewidths=lw + 1.5, linestyles=ls, zorder=zorder)
+               colors=outline_color, linewidths=outline_lw,
+               linestyles=ls, zorder=zorder)
     return ax.contour(X, Y, Z, levels=levels,
-                      colors=color, linewidths=lw, linestyles=ls, zorder=zorder + 1)
+                      colors=color, linewidths=lw,
+                      linestyles=ls, zorder=zorder + 1)
 
-
-def _read_slice(
-    h5_path: str,
-    field_name: str,
-    time_indices: List[int],
-    z_target: float,
-    res: int = 320,
-    smooth_sigma: float = 0.8,
-) -> Tuple[List[np.ndarray], np.ndarray, np.ndarray, float]:
-    """
-    Read 2-D xy slices at z ~ z_target for each requested time index.
-    Interpolates scatter data onto a high-resolution regular grid and
-    applies Gaussian smoothing.
-
-    Returns
-    -------
-    images   : list of 2-D arrays (res, res), one per time index
-    x_lin    : 1-D linspace x values used for the grid (metres)
-    y_lin    : 1-D linspace y values used for the grid (metres)
-    actual_z : the z value actually used
-    """
-    with h5py.File(h5_path, "r") as f:
-        if "state" not in f or field_name not in f["state"]:
-            avail = _list_state_fields(f)
-            raise KeyError(
-                f"Field '{field_name}' not found in {h5_path}.\n"
-                f"Available fields under 'state': {avail}"
-            )
-
-        points = f["point"][:].astype(np.float32)
-        mask, actual_z = _find_z_layer(points, z_target)
-
-        slice_pts = points[mask]          # [M, 3]
-        slice_idx = np.where(mask)[0]     # global point indices
-
-        if slice_pts.shape[0] == 0:
-            raise ValueError(f"No points found near z={z_target} in {h5_path}.")
-
-        pts_x = slice_pts[:, 0]
-        pts_y = slice_pts[:, 1]
-
-        x_lin = np.linspace(pts_x.min(), pts_x.max(), res)
-        y_lin = np.linspace(pts_y.min(), pts_y.max(), res)
-        Xi, Yi = np.meshgrid(x_lin, y_lin)
-
-        is_phase = any(k in field_name for k in ["alpha", "gamma", "frac"])
-        interp_method = "linear"
-        sigma = 0.5 if is_phase else smooth_sigma
-
-        fkey = f"state/{field_name}"
-        images = []
-        for ti in time_indices:
-            raw = f[fkey][ti, :, 0].astype(np.float32)   # [N_total]
-            vals = raw[slice_idx]                          # [M]
-
-            img = _interp_grid(pts_x, pts_y, vals, Xi, Yi, method=interp_method)
-            img = _smooth_for_plot(img, sigma=sigma)
-
-            if is_phase and img is not None:
-                img = np.clip(img, 0, 1)
-
-            images.append(img.astype(np.float32) if img is not None else img)
-
-    return images, x_lin, y_lin, actual_z
 
 
 # ------------------------------------------------------------------
@@ -254,9 +166,9 @@ _FIELD_CMAP = {
 }
 _FIELD_LABEL = {
     "T":              "Temperature (K)",
-    "alpha.air":      "Air volume fraction",
-    "alpha.titanium": "Titanium volume fraction",
-    "gamma_liquid":   "Liquid fraction",
+    "alpha.air":      r"$\alpha_{\rm air}$",
+    "alpha.titanium": r"$\alpha_{\rm Ti}$",
+    "gamma_liquid":   r"$\gamma_{\rm liq}$",
 }
 
 
@@ -266,6 +178,76 @@ def _auto_cmap(field_name: str) -> str:
 
 def _auto_label(field_name: str) -> str:
     return _FIELD_LABEL.get(field_name, field_name)
+
+
+def _compute_active_x_range_mm(field_img, x_mm, threshold=0.01, above=True, margin_frac=0.08):
+    """
+    Find the x-range (in mm) where field is above/below *threshold*.
+    Returns (x_lo, x_hi) with a small margin, or None if no matching region.
+    """
+    col_val = np.nanmin(field_img, axis=0) if above else np.nanmax(field_img, axis=0)
+    active_cols = (np.where(col_val > threshold)[0] if above
+                   else np.where(col_val < threshold)[0])
+    if len(active_cols) == 0:
+        return None
+    x_lo = x_mm[active_cols[0]]
+    x_hi = x_mm[active_cols[-1]]
+    margin = (x_hi - x_lo) * margin_frac
+    return float(x_lo - margin), float(x_hi + margin)
+
+
+def _active_x_range_from_T(T_img, x_mm, T_threshold=800.0, margin_frac=0.05):
+    """Return (x_lo, x_hi) in mm where any row has T > T_threshold, or None."""
+    col_max = np.nanmax(T_img, axis=0)
+    active_cols = np.where(col_max > T_threshold)[0]
+    if len(active_cols) == 0:
+        return None
+    x_lo = x_mm[active_cols[0]]
+    x_hi = x_mm[active_cols[-1]]
+    margin = (x_hi - x_lo) * margin_frac
+    return float(x_lo - margin), float(x_hi + margin)
+
+
+def _read_slice(
+    h5_path: str,
+    field_name: str,
+    time_indices: List[int],
+    z_target: float,
+    res: int = 320,
+    smooth_sigma: float = 0.8,
+) -> Tuple[List[np.ndarray], np.ndarray, np.ndarray, float]:
+    with h5py.File(h5_path, "r") as f:
+        if "state" not in f or field_name not in f["state"]:
+            avail = _list_state_fields(f)
+            raise KeyError(
+                f"Field '{field_name}' not found in {h5_path}.\n"
+                f"Available fields under 'state': {avail}"
+            )
+        points = f["point"][:].astype(np.float32)
+        mask, actual_z = _find_z_layer(points, z_target)
+        slice_pts = points[mask]
+        slice_idx = np.where(mask)[0]
+        if slice_pts.shape[0] == 0:
+            raise ValueError(f"No points found near z={z_target} in {h5_path}.")
+        pts_x = slice_pts[:, 0]
+        pts_y = slice_pts[:, 1]
+        x_lin = np.linspace(pts_x.min(), pts_x.max(), res)
+        y_lin = np.linspace(pts_y.min(), pts_y.max(), res)
+        Xi, Yi = np.meshgrid(x_lin, y_lin)
+        is_phase = any(k in field_name for k in ["alpha", "gamma", "frac"])
+        interp_method = "linear"
+        sigma = 0.5 if is_phase else smooth_sigma
+        fkey = f"state/{field_name}"
+        images = []
+        for ti in time_indices:
+            raw = f[fkey][ti, :, 0].astype(np.float32)
+            vals = raw[slice_idx]
+            img = _interp_grid(pts_x, pts_y, vals, Xi, Yi, method=interp_method)
+            img = _smooth_for_plot(img, sigma=sigma)
+            if is_phase and img is not None:
+                img = np.clip(img, 0, 1)
+            images.append(img.astype(np.float32) if img is not None else img)
+    return images, x_lin, y_lin, actual_z
 
 
 # ------------------------------------------------------------------
@@ -282,14 +264,8 @@ def plot_comparison(
     cmap: Optional[str] = None,
     dpi: int = 300,
 ) -> str:
-    """
-    Build and save the 2xN comparison figure.
-
-    Returns the path to the saved PNG file.
-    """
     if selected_times is None:
         selected_times = [0.0, 2e-5, 4e-5, 6e-5, 8e-5, 1e-4]
-
     if cmap is None:
         cmap = _auto_cmap(field_name)
 
@@ -297,28 +273,25 @@ def plot_comparison(
     print("Reading metadata ...")
     meta_c = _read_meta(conduction_h5)
     meta_k = _read_meta(keyhole_h5)
-
-    print(f"\nConduction grid shape (nx,ny,nz): {meta_c['grid_shape']}")
-    print(f"Keyhole    grid shape (nx,ny,nz): {meta_k['grid_shape']}")
+    print(f"\nConduction grid shape: {meta_c['grid_shape']}")
+    print(f"Keyhole    grid shape: {meta_k['grid_shape']}")
 
     # ---- find time indices --------------------------------------------
-    print(f"\nConduction time indices for selected_times:")
+    print(f"\nConduction time indices:")
     t_idx_c = _find_time_indices(meta_c["time"], selected_times)
-    print(f"\nKeyhole time indices for selected_times:")
+    print(f"\nKeyhole time indices:")
     t_idx_k = _find_time_indices(meta_k["time"], selected_times)
 
     # ---- read main field slices ---------------------------------------
-    print(f"\nReading conduction slices (field='{field_name}', z~{z_slice:.3e}) ...")
+    print(f"\nReading conduction slices (field='{field_name}') ...")
     imgs_c, x_c, y_c, actual_z_c = _read_slice(conduction_h5, field_name, t_idx_c, z_slice)
-    print(f"  Actual z selected (conduction): {actual_z_c:.6e} m  "
-          f"(grid res: {len(y_c)}x{len(x_c)})")
+    print(f"  z = {actual_z_c:.6e} m  (grid {len(y_c)}x{len(x_c)})")
 
-    print(f"\nReading keyhole slices (field='{field_name}', z~{z_slice:.3e}) ...")
+    print(f"\nReading keyhole slices (field='{field_name}') ...")
     imgs_k, x_k, y_k, actual_z_k = _read_slice(keyhole_h5, field_name, t_idx_k, z_slice)
-    print(f"  Actual z selected (keyhole):    {actual_z_k:.6e} m  "
-          f"(grid res: {len(y_k)}x{len(x_k)})")
+    print(f"  z = {actual_z_k:.6e} m  (grid {len(y_k)}x{len(x_k)})")
 
-    # ---- read alpha.air for the air-metal interface contour -----------
+    # ---- read alpha.air -----------------------------------------------
     has_air = False
     imgs_air_c, imgs_air_k = None, None
     if field_name == "alpha.air":
@@ -327,105 +300,106 @@ def plot_comparison(
     elif "alpha.air" in meta_c.get("available_fields", []) and \
          "alpha.air" in meta_k.get("available_fields", []):
         try:
-            print(f"\nReading alpha.air for interface contour ...")
+            print("\nReading alpha.air for interface contour ...")
             imgs_air_c, _, _, _ = _read_slice(conduction_h5, "alpha.air", t_idx_c, z_slice)
             imgs_air_k, _, _, _ = _read_slice(keyhole_h5, "alpha.air", t_idx_k, z_slice)
             has_air = True
         except Exception as e:
             warnings.warn(f"Could not read alpha.air: {e}")
 
-    # ---- read gamma_liquid for melt-pool boundary contour -------------
+    # ---- read T for active-region mask (T > 800 K) -------------------
+    has_temp = False
+    imgs_T_c, imgs_T_k = None, None
+    if "T" in meta_c.get("available_fields", []) and \
+       "T" in meta_k.get("available_fields", []):
+        try:
+            print("\nReading T for active-region mask ...")
+            imgs_T_c, _, _, _ = _read_slice(conduction_h5, "T", t_idx_c, z_slice)
+            imgs_T_k, _, _, _ = _read_slice(keyhole_h5, "T", t_idx_k, z_slice)
+            has_temp = True
+        except Exception as e:
+            warnings.warn(f"Could not read T: {e}")
+
+    # ---- read gamma_liquid --------------------------------------------
     has_meltpool = False
     imgs_gamma_c, imgs_gamma_k = None, None
     if "gamma_liquid" in meta_c.get("available_fields", []) and \
        "gamma_liquid" in meta_k.get("available_fields", []):
         try:
-            print(f"\nReading gamma_liquid for melt-pool contour ...")
+            print("\nReading gamma_liquid for melt-pool contour ...")
             imgs_gamma_c, _, _, _ = _read_slice(conduction_h5, "gamma_liquid", t_idx_c, z_slice)
             imgs_gamma_k, _, _, _ = _read_slice(keyhole_h5, "gamma_liquid", t_idx_k, z_slice)
             has_meltpool = True
         except Exception as e:
             warnings.warn(f"Could not read gamma_liquid: {e}")
 
-    # ---- compute melt-pool field: gamma_liquid * (1 - alpha.air) ------
-    meltpool_c, meltpool_k = None, None
-    if has_air and has_meltpool:
-        meltpool_c = [
-            np.clip(g * (1.0 - a), 0, 1)
-            for g, a in zip(imgs_gamma_c, imgs_air_c)
-        ]
-        meltpool_k = [
-            np.clip(g * (1.0 - a), 0, 1)
-            for g, a in zip(imgs_gamma_k, imgs_air_k)
-        ]
-        print("  Melt-pool field computed: gamma_liquid * (1 - alpha.air)")
+    # ---- thresholds ---------------------------------------------------
+    AIR_THRESHOLD = 0.99   # alpha.air above this → pure air (excluded from active region)
+    Y_GAMMA_CLIP  = 1e-4   # y [m] above which the gamma=0.5 contour is clipped
 
     # ---- unified colorbar range ---------------------------------------
     all_vals = np.concatenate(
         [img.ravel() for img in imgs_c + imgs_k if not np.all(np.isnan(img))]
     )
-    vmin = float(np.nanmin(all_vals))
-    vmax = float(np.nanmax(all_vals))
+    vmin, vmax = float(np.nanmin(all_vals)), float(np.nanmax(all_vals))
     print(f"\nColorbar range: [{vmin:.4g}, {vmax:.4g}]")
-
     norm = Normalize(vmin=vmin, vmax=vmax)
 
-    # ---- contour meshgrids (shared across all fields from same file) ---
-    Xc, Yc = np.meshgrid(x_c, y_c)   # conduction
-    Xk, Yk = np.meshgrid(x_k, y_k)   # keyhole
+    # ---- contour meshgrids --------------------------------------------
+    Xc, Yc = np.meshgrid(x_c, y_c)
+    Xk, Yk = np.meshgrid(x_k, y_k)
 
     # ---- figure layout ------------------------------------------------
     n_cols = len(selected_times)
-
-    # Physical spans (metres -> mm for display)
     x_span_c = float(x_c[-1] - x_c[0]) if len(x_c) > 1 else 1.0
     y_span_c = float(y_c[-1] - y_c[0]) if len(y_c) > 1 else 1.0
     y_span_k = float(y_k[-1] - y_k[0]) if len(y_k) > 1 else 1.0
-    x_span = x_span_c   # same for both datasets (~0.56 mm)
-
-    # Data aspect ratio (height / width) for each dataset
+    x_span = x_span_c
     aspect_c = y_span_c / x_span
     aspect_k = y_span_k / x_span
 
-    # GridSpec margins (fractions of figure)
-    gs_left, gs_right = 0.08, 0.94
-    gs_top, gs_bottom = 0.93, 0.06
-    cbar_width_ratio = 0.05
-    hspace = 0.35
-    wspace = 0.06
+    gs_left, gs_right = 0.06, 0.93
+    gs_top, gs_bottom = 0.90, 0.22
+    cbar_width_ratio = 0.04
+    hspace = 0.30
+    wspace = 0.05
 
     grid_rel_w = gs_right - gs_left
     grid_rel_h = gs_top - gs_bottom
     sum_aspects = aspect_c + aspect_k
     sum_w_ratios = n_cols + cbar_width_ratio
 
-    fig_w = 12.0
+    fig_w = 7.2   # about 183 mm — suitable for double-column journal width
     fig_h = fig_w * sum_aspects * grid_rel_w / (grid_rel_h * sum_w_ratios)
 
-    # ---- academic-style rcParams --------------------------------------
+    # ---- academic rcParams --------------------------------------------
     plt.rcParams.update({
-        "font.family":      "serif",
-        "font.serif":       ["Times New Roman", "DejaVu Serif", "Liberation Serif"],
-        "font.size":        8,
-        "axes.linewidth":   0.6,
-        "xtick.direction":  "in",
-        "ytick.direction":  "in",
-        "xtick.major.size": 2.5,
-        "ytick.major.size": 2.5,
-        "xtick.major.width": 0.5,
-        "ytick.major.width": 0.5,
-        "xtick.minor.size": 1.5,
-        "ytick.minor.size": 1.5,
-        "xtick.minor.width": 0.4,
-        "ytick.minor.width": 0.4,
-        "xtick.labelsize":  6.5,
-        "ytick.labelsize":  6.5,
-        "axes.labelsize":   7.5,
-        "axes.titlesize":   8,
-        "legend.fontsize":  7,
-        "figure.facecolor": "white",
-        "axes.facecolor":   "white",
-        "savefig.bbox":     "tight",
+        "font.family":        "serif",
+        "font.serif":         ["Times New Roman", "DejaVu Serif", "Liberation Serif"],
+        "mathtext.fontset":   "dejavuserif",
+        "font.size":          7,
+        "axes.linewidth":     0.4,
+        "xtick.direction":    "in",
+        "ytick.direction":    "in",
+        "xtick.top":          True,
+        "ytick.right":        True,
+        "xtick.major.size":   2.0,
+        "ytick.major.size":   2.0,
+        "xtick.major.width":  0.4,
+        "ytick.major.width":  0.4,
+        "xtick.minor.visible": False,
+        "ytick.minor.visible": False,
+        "xtick.labelsize":    6,
+        "ytick.labelsize":    6,
+        "axes.labelsize":     7,
+        "axes.titlesize":     7,
+        "legend.fontsize":    5.5,
+        "legend.frameon":     True,
+        "legend.edgecolor":   "0.6",
+        "legend.fancybox":    False,
+        "figure.facecolor":   "white",
+        "axes.facecolor":     "white",
+        "savefig.bbox":       "tight",
         "savefig.pad_inches": 0.02,
     })
 
@@ -449,27 +423,30 @@ def plot_comparison(
     def _fmt_time(t: float) -> str:
         t_us = t * 1e6
         if abs(t_us - round(t_us)) < 1e-3:
-            return f"t = {int(round(t_us))} µs"
-        return f"t = {t_us:.1f} µs"
+            return rf"$t$ = {int(round(t_us))} $\mu$s"
+        return rf"$t$ = {t_us:.1f} $\mu$s"
+
+    # ---- build legend handles -----------------------------------------
+    contour_handles, contour_labels = [], []
+
+    # Solid-liquid boundary (gamma_liquid = 0.5, y < 1e-4 m)
+    if has_meltpool:
+        h = Line2D([0], [0], color='#E05050', lw=0.9, ls='-',
+                   path_effects=[Stroke(linewidth=1.5, foreground='white'),
+                                 Normal()])
+        contour_handles.append(h)
+        contour_labels.append(r"Solid--liquid interface ($\gamma_{\rm liq}=0.5$, $y < 0.1$ mm)")
+
+    # Liquid-gas boundary (alpha.air = 0.5)
+    if has_air:
+        h = Line2D([0], [0], color='#00CFFF', lw=0.9, ls='--',
+                   path_effects=[Stroke(linewidth=1.5, foreground='white'),
+                                 Normal()])
+        contour_handles.append(h)
+        contour_labels.append(r"Liquid--gas interface ($\alpha_{\rm air}=0.5$)")
 
     axes_c: List[plt.Axes] = []
     axes_k: List[plt.Axes] = []
-
-    # ---- contour legend handles (built once, added to first panel) ----
-    outline_effect = [Stroke(linewidth=2.2, foreground='black'), Normal()]
-    contour_handles = []
-    contour_labels = []
-    if has_air:
-        h_air = Line2D([0], [0], color='white', lw=1.0, ls='--')
-        h_air.set_path_effects(outline_effect)
-        contour_handles.append(h_air)
-        contour_labels.append(r"$\mathregular{\alpha_{air}}=0.5$")
-    if has_meltpool:
-        h_mp = Line2D([0], [0], color='#FFD700', lw=1.0, ls='-')
-        h_mp.set_path_effects(outline_effect)
-        contour_handles.append(h_mp)
-        contour_labels.append(
-            r"$\mathregular{\gamma_{liq}(1-\alpha_{air})}=0.5$")
 
     for col, (t_target, img_c, img_k) in enumerate(
         zip(selected_times, imgs_c, imgs_k)
@@ -479,94 +456,162 @@ def plot_comparison(
         axes_c.append(ax_c)
         axes_k.append(ax_k)
 
-        # extent: [x_min, x_max, y_min, y_max] in mm
         ext_c = [x_c_mm[0], x_c_mm[-1], y_c_mm[0], y_c_mm[-1]]
         ext_k = [x_k_mm[0], x_k_mm[-1], y_k_mm[0], y_k_mm[-1]]
 
         # ---- main field image -----------------------------------------
-        ax_c.imshow(
-            img_c, origin="lower", aspect="auto",
-            extent=ext_c, cmap=cmap, norm=norm, interpolation="bicubic",
-        )
-        ax_k.imshow(
-            img_k, origin="lower", aspect="auto",
-            extent=ext_k, cmap=cmap, norm=norm, interpolation="bicubic",
-        )
+        ax_c.imshow(img_c, origin="lower", aspect="auto",
+                    extent=ext_c, cmap=cmap, norm=norm, interpolation="bicubic")
+        ax_k.imshow(img_k, origin="lower", aspect="auto",
+                    extent=ext_k, cmap=cmap, norm=norm, interpolation="bicubic")
 
-        # ---- contour overlays (use metre coordinates for meshgrid) ----
-        for ax, Xg, Yg, air_img_list, mp_img_list in [
-            (ax_c, Xc, Yc, imgs_air_c, meltpool_c),
-            (ax_k, Xk, Yk, imgs_air_k, meltpool_k),
+        # ---- contour overlays -----------------------------------------
+        # Determine T-based active x-range for liquid-gas contour
+        T_range_c = None
+        T_range_k = None
+        if has_temp and imgs_T_c is not None:
+            T_range_c = _active_x_range_from_T(imgs_T_c[col], x_c_mm)
+        if has_temp and imgs_T_k is not None:
+            T_range_k = _active_x_range_from_T(imgs_T_k[col], x_k_mm)
+
+        for ax, Xg, Yg, x_mm_arr, air_list, gamma_list, T_active_range in [
+            (ax_c, Xc, Yc, x_c_mm, imgs_air_c, imgs_gamma_c, T_range_c),
+            (ax_k, Xk, Yk, x_k_mm, imgs_air_k, imgs_gamma_k, T_range_k),
         ]:
-            # alpha.air = 0.5  (air-metal interface)
-            if has_air and air_img_list is not None:
-                _contour_outlined(
-                    ax, Xg * 1e3, Yg * 1e3, air_img_list[col],
-                    levels=[0.5], color='white', lw=1.0, ls='--', zorder=6,
-                )
+            # Active x-range for gamma contour (melt-pool region)
+            gamma_active_range = None
+            if has_meltpool and gamma_list is not None:
+                gamma_active_range = _compute_active_x_range_mm(
+                    gamma_list[col], x_mm_arr, threshold=0.01, above=True)
+            elif has_air and air_list is not None:
+                gamma_active_range = _compute_active_x_range_mm(
+                    air_list[col], x_mm_arr, threshold=0.99, above=False)
 
-            # melt-pool boundary  (gamma_liquid * (1-alpha.air) = 0.5)
-            if has_meltpool and mp_img_list is not None:
-                _contour_outlined(
-                    ax, Xg * 1e3, Yg * 1e3, mp_img_list[col],
-                    levels=[0.5], color='#FFD700', lw=1.0, ls='-', zorder=6,
-                )
+            Xg_mm = Xg * 1e3
+            Yg_mm = Yg * 1e3
 
-        # column title (top row only)
-        ax_c.set_title(_fmt_time(t_target), pad=4, fontsize=8, fontweight='normal')
+            # --- solid-liquid boundary: gamma_liquid = 0.5, clipped to y < Y_GAMMA_CLIP ---
+            if has_meltpool and gamma_list is not None:
+                if gamma_active_range is not None:
+                    x_lo, x_hi = gamma_active_range
+                    col_mask_g = (x_mm_arr >= x_lo) & (x_mm_arr <= x_hi)
+                    Xg_sub_g = Xg_mm[:, col_mask_g]
+                    Yg_sub_g = Yg_mm[:, col_mask_g]
+                    gamma_sub = gamma_list[col][:, col_mask_g]
+                    Yg_for_mask = Yg[:, col_mask_g]
+                else:
+                    Xg_sub_g, Yg_sub_g = Xg_mm, Yg_mm
+                    gamma_sub = gamma_list[col]
+                    Yg_for_mask = Yg
+                gamma_clipped = np.where(Yg_for_mask < Y_GAMMA_CLIP, gamma_sub, np.nan)
+                try:
+                    _contour_outlined(
+                        ax, Xg_sub_g, Yg_sub_g, gamma_clipped,
+                        levels=[0.5],
+                        color='#E05050', lw=0.9, ls='-', zorder=7,
+                        outline_color='white', outline_lw=1.8,
+                    )
+                except Exception:
+                    pass
 
-        # x-axis label only on bottom row
-        ax_k.set_xlabel("x (mm)", labelpad=1)
-        ax_c.set_xticklabels([])
+            # --- liquid-gas boundary: alpha.air = 0.5, restricted to T > 800 x-range ---
+            if has_air and air_list is not None:
+                if T_active_range is not None:
+                    x_lo, x_hi = T_active_range
+                    col_mask_a = (x_mm_arr >= x_lo) & (x_mm_arr <= x_hi)
+                    Xg_sub_a = Xg_mm[:, col_mask_a]
+                    Yg_sub_a = Yg_mm[:, col_mask_a]
+                    air_sub = air_list[col][:, col_mask_a]
+                else:
+                    Xg_sub_a, Yg_sub_a = Xg_mm, Yg_mm
+                    air_sub = air_list[col]
+                try:
+                    _contour_outlined(
+                        ax, Xg_sub_a, Yg_sub_a, air_sub,
+                        levels=[0.5],
+                        color='#00CFFF', lw=0.9, ls='--', zorder=7,
+                        outline_color='white', outline_lw=1.8,
+                    )
+                except Exception:
+                    pass
 
-        # y-axis label only on leftmost column
+        # ---- panel labels (a)-(h) ------------------------------------
+        panel_idx = col + 0 * n_cols
+        panel_idx2 = col + 1 * n_cols
+        letters = "abcdefghijklmnop"
+        if panel_idx < len(letters):
+            ax_c.text(0.03, 0.93, f"({letters[panel_idx]})",
+                      transform=ax_c.transAxes, fontsize=7, fontweight='bold',
+                      va='top', ha='left', color='white',
+                      path_effects=[Stroke(linewidth=1.5, foreground='black'),
+                                    Normal()])
+        if panel_idx2 < len(letters):
+            ax_k.text(0.03, 0.93, f"({letters[panel_idx2]})",
+                      transform=ax_k.transAxes, fontsize=7, fontweight='bold',
+                      va='top', ha='left', color='white',
+                      path_effects=[Stroke(linewidth=1.5, foreground='black'),
+                                    Normal()])
+
+        # column title
+        ax_c.set_title(_fmt_time(t_target), pad=3, fontsize=7)
+
+        # x-axis: bottom row shows label on every column
+        ax_c.tick_params(labelbottom=False)
+        ax_k.set_xlabel(r"$x$ (mm)", labelpad=1)
+
+        # y-axis: only leftmost column shows tick labels and axis label
         if col == 0:
-            ax_c.set_ylabel("y (mm)", labelpad=1)
-            ax_k.set_ylabel("y (mm)", labelpad=1)
+            ax_c.set_ylabel(r"$y$ (mm)", labelpad=2)
+            ax_k.set_ylabel(r"$y$ (mm)", labelpad=2)
         else:
-            ax_c.set_yticklabels([])
-            ax_k.set_yticklabels([])
+            ax_c.tick_params(labelleft=False)
+            ax_k.tick_params(labelleft=False)
 
-        # tick formatting
         for ax in (ax_c, ax_k):
             ax.xaxis.set_major_locator(ticker.MaxNLocator(4, prune="both"))
             ax.yaxis.set_major_locator(ticker.MaxNLocator(4, prune="both"))
             for spine in ax.spines.values():
-                spine.set_linewidth(0.5)
+                spine.set_linewidth(0.4)
 
-    # ---- row labels on the left side of each row ----------------------
+    # ---- row labels --------------------------------------------------
     axes_c[0].annotate(
         "Conduction mode",
         xy=(0, 0.5), xycoords="axes fraction",
-        xytext=(-0.55, 0.5), textcoords="axes fraction",
-        fontsize=9, fontweight="bold", va="center", ha="center",
-        rotation=90,
+        xytext=(-0.36, 0.5), textcoords="axes fraction",
+        fontsize=7.5, fontweight="bold", fontstyle="italic",
+        va="center", ha="center", rotation=90,
     )
     axes_k[0].annotate(
         "Keyhole mode",
         xy=(0, 0.5), xycoords="axes fraction",
-        xytext=(-0.55, 0.5), textcoords="axes fraction",
-        fontsize=9, fontweight="bold", va="center", ha="center",
-        rotation=90,
+        xytext=(-0.36, 0.5), textcoords="axes fraction",
+        fontsize=7.5, fontweight="bold", fontstyle="italic",
+        va="center", ha="center", rotation=90,
     )
 
-    # ---- contour legend (top-left panel) ------------------------------
+    # ---- legend at figure bottom ------------------------------------
     if contour_handles:
-        axes_c[0].legend(
+        fig.legend(
             handles=contour_handles, labels=contour_labels,
-            loc='upper right', framealpha=0.85, fontsize=6.5,
-            borderpad=0.4, labelspacing=0.3, handlelength=1.5,
-            handletextpad=0.5, borderaxespad=0.4,
+            loc='lower center',
+            bbox_to_anchor=(0.5, 0.06),
+            ncol=len(contour_handles),
+            frameon=True, framealpha=0.92, fontsize=6.5,
+            borderpad=0.4, labelspacing=0.5, handlelength=2.2,
+            handletextpad=0.5, borderaxespad=0.3,
+            edgecolor='0.5',
         )
 
-    # ---- colorbar -----------------------------------------------------
+    # ---- colorbar ----------------------------------------------------
     cbar_ax = fig.add_subplot(gs[:, -1])
     sm = ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, cax=cbar_ax)
-    cbar.set_label(_auto_label(field_name), fontsize=7.5, labelpad=3)
-    cbar.ax.tick_params(labelsize=6.5, width=0.5)
-    cbar.outline.set_linewidth(0.5)
+    cbar.set_label(_auto_label(field_name), fontsize=7, labelpad=2)
+    cbar.ax.tick_params(labelsize=6, width=0.4, length=2)
+    cbar.outline.set_linewidth(0.4)
+    # Set clean colorbar ticks
+    cbar.ax.yaxis.set_major_locator(ticker.MaxNLocator(5, prune="both"))
 
     # ---- save ---------------------------------------------------------
     out_dir = Path(output_dir)
@@ -587,33 +632,23 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Plot LPBF conduction vs. keyhole mode cross-section comparison."
     )
-    parser.add_argument("--conduction", default=CONDUCTION_H5,
-                        help="Path to conduction-mode HDF5 file.")
-    parser.add_argument("--keyhole", default=KEYHOLE_H5,
-                        help="Path to keyhole-mode HDF5 file.")
-    parser.add_argument("--field", default=FIELD_NAME,
-                        help="Physical field name, e.g. T, alpha.air, gamma_liquid.")
-    parser.add_argument("--z_slice", type=float, default=Z_SLICE,
-                        help="Target z coordinate for the cross-section (metres).")
-    parser.add_argument("--times", type=float, nargs="+", default=SELECTED_TIMES,
-                        help="Target physical times (seconds).")
-    parser.add_argument("--output_dir", default=OUTPUT_DIR,
-                        help="Directory to save the output PNG.")
-    parser.add_argument("--cmap", default=None,
-                        help="Matplotlib colormap name (auto-selected if omitted).")
-    parser.add_argument("--dpi", type=int, default=300,
-                        help="Output resolution in DPI.")
+    parser.add_argument("--conduction", default=CONDUCTION_H5)
+    parser.add_argument("--keyhole", default=KEYHOLE_H5)
+    parser.add_argument("--field", default=FIELD_NAME)
+    parser.add_argument("--z_slice", type=float, default=Z_SLICE)
+    parser.add_argument("--times", type=float, nargs="+", default=SELECTED_TIMES)
+    parser.add_argument("--output_dir", default=OUTPUT_DIR)
+    parser.add_argument("--cmap", default=None)
+    parser.add_argument("--dpi", type=int, default=300)
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-
     for label, path in [("Conduction", args.conduction), ("Keyhole", args.keyhole)]:
         if not Path(path).exists():
             print(f"ERROR: {label} HDF5 file not found: {path}", file=sys.stderr)
             sys.exit(1)
-
     plot_comparison(
         conduction_h5=args.conduction,
         keyhole_h5=args.keyhole,

@@ -23,6 +23,8 @@ import copy
 import math
 import traceback
 import sys
+import json
+import hashlib
 from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
@@ -34,7 +36,7 @@ from torch.optim import AdamW
 
 from src.dataset import AeroGtoDataset, AeroGtoDataset2D, CutAeroGtoDataset, LPBFLaserDataset
 from src.train import train, validate, get_train_loss, _init_region_agg, _accumulate_region, _finalize_region
-from src.utils import set_seed, init_weights, parse_args, load_json_config
+from src.utils import set_seed, init_weights, parse_args, load_json_config, _resolve_model_path
 
 
 # =============================================================================
@@ -216,7 +218,6 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
     # ckpt_threshold overrides config check_point when provided
     check_point = ckpt_threshold if ckpt_threshold is not None else args.train.get("check_point", False)
     weight_loss = args.train.get("weight_loss", {"enable": False})
-    grad_loss_weight = args.train.get("grad_loss_weight", 8.0)
     model_name = args.model.get("name", "PhysGTO")
 
     agg = {}
@@ -284,7 +285,7 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
                         state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, check_point)
                 # Loss on original horizon
                 costs = get_train_loss(fields, predict_hat[:, :base_horizon], state[:, 1:base_horizon+1], normalizer, weight_loss, active_mask=base_mask)
-                loss_base = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
+                loss_base = costs["loss"]
 
                 # Loss on extra steps (pushforward)
                 if T_pf > base_horizon and state.shape[1] > base_horizon + 1:
@@ -294,7 +295,7 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
                         fields, predict_hat[:, base_horizon:T_extra],
                         state[:, base_horizon+1:T_extra+1], normalizer, weight_loss, active_mask=pf_mask
                     )
-                    loss_pf = costs_pf["value_loss"] + grad_loss_weight * costs_pf["grad_loss"]
+                    loss_pf = costs_pf["loss"]
                     total_loss = loss_base + 0.5 * loss_pf  # pushforward weighted less
                 else:
                     total_loss = loss_base
@@ -342,7 +343,7 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
                     state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, check_point
                 )
             costs = get_train_loss(fields, predict_hat[:, :base_horizon], state[:, 1:base_horizon+1], normalizer, weight_loss, active_mask=base_mask)
-            loss_base = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
+            loss_base = costs["loss"]
 
             if T_pf > base_horizon and state.shape[1] > base_horizon + 1:
                 T_extra = min(T_pf, state.shape[1] - 1)
@@ -351,7 +352,7 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
                     fields, predict_hat[:, base_horizon:T_extra],
                     state[:, base_horizon+1:T_extra+1], normalizer, weight_loss, active_mask=pf_mask
                 )
-                loss_pf = costs_pf["value_loss"] + grad_loss_weight * costs_pf["grad_loss"]
+                loss_pf = costs_pf["loss"]
                 total_loss = loss_base + 0.5 * loss_pf
             else:
                 total_loss = loss_base
@@ -428,7 +429,6 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
     # ckpt_threshold overrides config check_point when provided (set by _probe_ckpt_threshold)
     check_point = ckpt_threshold if ckpt_threshold is not None else args.train.get("check_point", False)
     weight_loss = args.train.get("weight_loss", {"enable": False})
-    grad_loss_weight = args.train.get("grad_loss_weight", 8.0)
     model_name = args.model.get("name", "PhysGTO")
 
     agg = {}
@@ -485,8 +485,8 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
 
                 costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss, active_mask=active_mask)
 
-            # Use configurable grad_loss_weight
-            loss = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
+            # Use costs["loss"] which already applies grad_loss_multiplier from weight_loss config
+            loss = costs["loss"]
 
             # NaN guard / Loss spike guard: 跳过异常 batch，并释放计算图显存
             _skip = False
@@ -527,7 +527,7 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
 
             costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss, active_mask=active_mask)
 
-            loss = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
+            loss = costs["loss"]
 
             # NaN guard / Loss spike guard
             _skip = False
@@ -594,32 +594,144 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
 
 
 # =============================================================================
+# Adaptive checkpoint threshold probing  (per-horizon table + disk cache)
+# =============================================================================
+
+def _compute_probe_cache_key(args, max_node_count, device):
+    """构建 probe 缓存键。返回 (16字符 sha256 哈希, key_inputs dict)。"""
+    model_cfg = dict(args.model) if isinstance(args.model, dict) else dict(vars(args.model))
+    model_cfg.pop("load_path", None)
+
+    pf_cfg = args.train.get("pushforward", {"enable": False}) if isinstance(args.train, dict) else {}
+    data_cfg = args.data if isinstance(args.data, dict) else {}
+    train_cfg = data_cfg.get("train", {}) if isinstance(data_cfg, dict) else {}
+
+    try:
+        gpu_name = torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu"
+    except Exception:
+        gpu_name = "unknown"
+
+    key_inputs = {
+        "model_cfg": model_cfg,
+        "batchsize": train_cfg.get("batchsize", 1),
+        "horizon_train": data_cfg.get("horizon_train", 1),
+        "pf_enable": bool(pf_cfg.get("enable", False)),
+        "pf_extra_max": int(pf_cfg.get("extra_steps", 0)),
+        "use_amp": bool(args.train.get("use_amp", False)) if isinstance(args.train, dict) else False,
+        "max_node_count": int(max_node_count),
+        "gpu_name": gpu_name,
+        "torch_version": torch.__version__,
+    }
+    blob = json.dumps(key_inputs, sort_keys=True, default=str)
+    cache_key = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+    return cache_key, key_inputs
+
+
+def _ckpt_table_to_json(table):
+    """ckpt_table 序列化：int key → str；保留 True/False/int value。"""
+    return {str(h): v for h, v in table.items()}
+
+
+def _ckpt_table_from_json(obj):
+    """ckpt_table 反序列化：str key → int；保留 True/False/int value（json 已天然区分）。"""
+    return {int(h): v for h, v in obj.items()}
+
+
+def _format_ckpt_table(table):
+    """格式化 per-horizon 表为多行字符串。"""
+    lines = []
+    for h in sorted(table.keys()):
+        v = table[h]
+        if v is True:
+            lines.append(f"  h={h}: FULL CKP (still OOM risk)")
+        elif v == h:
+            lines.append(f"  h={h}: no ckp")
+        else:
+            lines.append(f"  h={h}: threshold={v} ({v} free + {h - v} ckp)")
+    return "\n".join(lines)
+
+
+def _diff_key_inputs(old, new):
+    """返回 old 与 new 中字段差异的可读字符串，用于解释 cache MISS 原因。"""
+    diffs = []
+    keys = set(old.keys()) | set(new.keys())
+    for k in sorted(keys):
+        ov, nv = old.get(k, "<absent>"), new.get(k, "<absent>")
+        if ov != nv:
+            if k == "model_cfg" and isinstance(ov, dict) and isinstance(nv, dict):
+                sub = sorted(set(ov.keys()) | set(nv.keys()))
+                sub_diffs = [f"{sk}: {ov.get(sk)!r} → {nv.get(sk)!r}"
+                             for sk in sub if ov.get(sk) != nv.get(sk)]
+                if sub_diffs:
+                    diffs.append("model_cfg{ " + ", ".join(sub_diffs) + " }")
+            else:
+                diffs.append(f"{k}: {ov!r} → {nv!r}")
+    return "; ".join(diffs) if diffs else "(no field-level diff, hash collision?)"
+
+
+def _load_probe_cache(cache_path, expected_key):
+    """读取 cache 文件。命中返回 (ckpt_table, key_inputs)；miss/损坏返回 (None, old_key_inputs_or_None)。"""
+    if not os.path.exists(cache_path):
+        return None, None
+    try:
+        with open(cache_path, "r") as f:
+            data = json.load(f)
+        if data.get("version") != 1:
+            return None, data.get("key_inputs")
+        if data.get("key") != expected_key:
+            return None, data.get("key_inputs")
+        return _ckpt_table_from_json(data["ckpt_table"]), data.get("key_inputs")
+    except (json.JSONDecodeError, KeyError, TypeError, OSError) as e:
+        print(f"[CKP Cache] Corrupted cache file ({e}), will re-probe.")
+        try:
+            os.remove(cache_path)
+        except OSError:
+            pass
+        return None, None
+
+
+def _save_probe_cache(cache_path, cache_key, key_inputs, ckpt_table):
+    """原子写入 cache 文件（先写 .tmp 再 rename）。失败仅打印 warning。"""
+    payload = {
+        "version": 1,
+        "key": cache_key,
+        "key_inputs": key_inputs,
+        "ckpt_table": _ckpt_table_to_json(ckpt_table),
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        tmp_path = cache_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+        os.replace(tmp_path, cache_path)
+    except OSError as e:
+        print(f"[CKP Cache] Warning: failed to save cache ({e})")
+
+
+# =============================================================================
 # Adaptive checkpoint threshold probing
 # =============================================================================
 
-def _probe_ckpt_threshold(model, first_batch, device, horizon, args, path_record="", run_name=""):
+def _probe_ckpt_threshold(model, first_batch, device, horizon, args, path_record="", run_name="", optimizer=None, normalizer=None):
     """
-    Binary-search for the maximum number of autoregressive steps that can run
-    without gradient checkpointing before OOM.
+    Build a per-horizon checkpoint threshold table.
 
-    `horizon` should be the MAXIMUM rollout length that will ever be used during
-    training (i.e. horizon_train + pf_extra_max when pushforward is enabled), so
-    the threshold is safe for the hardest epoch, not just the early easy ones.
+    For each possible rollout length h in [1, horizon], binary-search for the
+    maximum number of free (non-checkpointed) steps before OOM.
 
-    Returns an int k (0 <= k <= horizon):
-      - k == horizon : no checkpointing needed at all
-      - 0 <= k < horizon : use ckp from step k onwards; steps [0, k) run free
-      - returns True if even full ckp OOMs (fall back to config)
+    Returns a dict  {h: threshold}  where:
+      - threshold == h      → horizon h needs no checkpointing at all
+      - 0 <= threshold < h  → steps [0, threshold) free, [threshold, h) use ckp
+      - threshold is True   → even full ckp OOMs at this horizon (fallback)
 
-    The returned value is passed directly as check_point to autoregressive(),
-    which interprets it as:
-      check_point is True  → all steps use ckp
-      type(check_point) is int and t >= check_point → ckp from step k onwards
+    At training time, look up ckpt_table[actual_horizon] to get the optimal
+    threshold for the current epoch's rollout length.
     """
     if not torch.cuda.is_available():
-        return False
+        return {h: False for h in range(1, horizon + 1)}
     if horizon <= 1:
-        return False
+        return {1: False}
 
     from torch.amp import autocast
 
@@ -628,49 +740,64 @@ def _probe_ckpt_threshold(model, first_batch, device, horizon, args, path_record
     _use_lpbf   = model_name == "gto_lpbf"
     _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max", "gto_lpbf")
 
-    # Prepare a single-sample probe batch (use first sample only to minimise memory)
-    dt = first_batch['dt'][:1].to(device)
-    state = first_batch["state"][:1, :horizon + 1].to(device)
-    node_pos = first_batch["node_pos"][:1].to(device)
-    edges = first_batch["edges"][:1].to(device)
-    time_seq = first_batch["time_seq"][:1, :horizon].to(device)
-    conditions = first_batch["conditions"][:1].to(device).float()
+    dt = first_batch['dt'].to(device)
+    state_full = first_batch["state"][:, :horizon + 1].to(device)
+    node_pos = first_batch["node_pos"].to(device)
+    edges = first_batch["edges"].to(device)
+    time_seq_full = first_batch["time_seq"][:, :horizon].to(device)
+    conditions = first_batch["conditions"].to(device).float()
     spatial_inform = None
     if _use_spatial and "spatial_inform" in first_batch:
-        spatial_inform = first_batch["spatial_inform"][:1].to(device)
+        spatial_inform = first_batch["spatial_inform"].to(device)
 
-    def _try(ckpt_val):
-        """Run forward+backward with given check_point value. Returns True on success."""
+    fields = args.data.get("fields", ["T"])
+    weight_loss = args.train.get("weight_loss", {"enable": False})
+    if weight_loss.get("gradient", False) and "grid_shape" in first_batch:
+        weight_loss = dict(weight_loss)
+        weight_loss["grid_shape"] = first_batch["grid_shape"].numpy()
+
+    normalizer_ref = normalizer
+
+    def _try(h, ckpt_val):
+        """Run forward+backward with h steps and given check_point value."""
         torch.cuda.empty_cache()
+        _state = state_full[:, :h + 1]
+        _time_seq = time_seq_full[:, :h]
         try:
             model.train()
             if use_amp:
                 with autocast(device_type="cuda", dtype=torch.bfloat16):
                     if _use_lpbf:
                         out = _autoregressive_lpbf(
-                            model, state[:, 0], node_pos, edges, time_seq,
+                            model, _state[:, 0], node_pos, edges, _time_seq,
                             spatial_inform, conditions, dt, ckpt_val, first_batch, device)
                     elif _use_spatial and spatial_inform is not None:
-                        out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
+                        out = model.autoregressive(_state[:, 0], node_pos, edges, _time_seq,
                                                    spatial_inform, conditions, dt, ckpt_val)
                     else:
-                        out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
+                        out = model.autoregressive(_state[:, 0], node_pos, edges, _time_seq,
                                                    conditions, dt, ckpt_val)
             else:
                 if _use_lpbf:
                     out = _autoregressive_lpbf(
-                        model, state[:, 0], node_pos, edges, time_seq,
+                        model, _state[:, 0], node_pos, edges, _time_seq,
                         spatial_inform, conditions, dt, ckpt_val, first_batch, device)
                 elif _use_spatial and spatial_inform is not None:
-                    out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
+                    out = model.autoregressive(_state[:, 0], node_pos, edges, _time_seq,
                                                spatial_inform, conditions, dt, ckpt_val)
                 else:
-                    out = model.autoregressive(state[:, 0], node_pos, edges, time_seq,
+                    out = model.autoregressive(_state[:, 0], node_pos, edges, _time_seq,
                                                conditions, dt, ckpt_val)
-            loss = out.float().sum()
+            if normalizer_ref is not None:
+                costs = get_train_loss(fields, out, _state[:, 1:h+1], normalizer_ref, weight_loss)
+                loss = costs["loss"]
+            else:
+                loss = out.float().sum()
             loss.backward()
             model.zero_grad(set_to_none=True)
             del out, loss
+            if normalizer_ref is not None:
+                del costs
             torch.cuda.empty_cache()
             return True
         except torch.cuda.OutOfMemoryError:
@@ -691,30 +818,69 @@ def _probe_ckpt_threshold(model, first_batch, device, horizon, args, path_record
             except Exception:
                 pass
 
-    _log(f"[CKP Probe] Probing checkpoint threshold (horizon={horizon}) ...")
+    _log(f"[CKP Probe] Building per-horizon checkpoint table (max horizon={horizon}) ...")
 
-    # Step 1: try without any checkpointing
-    if _try(False):
-        _log(f"[CKP Probe] No OOM without ckp → ckpt_threshold={horizon} (no ckp used)")
-        return horizon  # no ckp needed
+    if optimizer is not None and len(optimizer.state) == 0:
+        _log("[CKP Probe] Warming up optimizer state (Adam m/v not yet allocated)...")
+        try:
+            _param_backup = [p.data.clone() for p in model.parameters() if p.requires_grad]
+            model.train()
+            _dummy_loss = sum(p.sum() for p in model.parameters() if p.requires_grad)
+            _dummy_loss.backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            for p, backup in zip((q for q in model.parameters() if q.requires_grad), _param_backup):
+                p.data.copy_(backup)
+            del _param_backup, _dummy_loss
+            torch.cuda.empty_cache()
+            _log("[CKP Probe] Optimizer state allocated.")
+        except Exception as _e:
+            _log(f"[CKP Probe] Optimizer warmup failed ({_e}), continuing without.")
+            model.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
 
-    # Step 2: try with full checkpointing
-    if not _try(True):
-        _log(f"[CKP Probe] OOM even with full ckp → falling back to config check_point")
-        return True  # let training handle it (will likely OOM, but that's the user's config)
+    table = {}
+    max_free_from_prev = horizon
 
-    # Step 3: binary search for max k such that _try(k) succeeds
-    # k=0 ≡ True (all ckp, known to succeed); k=horizon ≡ False (no ckp, known to fail)
-    lo, hi = 0, horizon - 1
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if _try(mid):
-            lo = mid
+    for h in range(horizon, 0, -1):
+        if _try(h, False):
+            table[h] = h
+            _log(f"[CKP Probe]   horizon={h}: no ckp needed (all {h} steps free)")
+            for hh in range(h - 1, 0, -1):
+                table[hh] = hh
+            _log(f"[CKP Probe]   horizon 1~{h-1}: no ckp needed (smaller than {h})")
+            break
+
+        if not _try(h, True):
+            table[h] = True
+            _log(f"[CKP Probe]   horizon={h}: OOM even with full ckp!")
+            continue
+
+        lo, hi = 0, min(h - 1, max_free_from_prev)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _try(h, mid):
+                lo = mid
+            else:
+                hi = mid - 1
+
+        safe_lo = max(0, lo - 1)
+        table[h] = safe_lo
+        max_free_from_prev = lo
+        _log(f"[CKP Probe]   horizon={h}: threshold={safe_lo} "
+             f"(steps [0,{safe_lo}) free, [{safe_lo},{h}) ckp)")
+
+    _log("[CKP Probe] Final table:")
+    for h in sorted(table.keys()):
+        v = table[h]
+        if v is True:
+            _log(f"  h={h}: FULL CKP (still OOM risk)")
+        elif v == h:
+            _log(f"  h={h}: no ckp")
         else:
-            hi = mid - 1
+            _log(f"  h={h}: threshold={v} ({v} free + {h - v} ckp)")
 
-    _log(f"[CKP Probe] ckpt_threshold={lo}: steps [0,{lo}) free, steps [{lo},{horizon}) use ckp")
-    return lo
+    return table
 
 
 # =============================================================================
@@ -823,12 +989,23 @@ def get_model(args, device, cond_dim, default_dt):
     checkpoint = None
 
     if load_path:
-        model_path = os.path.join(load_path, f"{args.name}_best.pt")
-        if os.path.exists(model_path):
-            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-            state_dict = checkpoint.get("state_dict", checkpoint)
-            model.load_state_dict(state_dict, strict=False)
-            print(f"Loaded model from {model_path}")
+        resolved_path = _resolve_model_path(load_path, args.name)
+        if resolved_path and os.path.exists(resolved_path):
+            try:
+                checkpoint = torch.load(resolved_path, map_location=device, weights_only=False)
+                state_dict = checkpoint.get("state_dict", checkpoint)
+                model.load_state_dict(state_dict, strict=False)
+                print(f"Loaded model from {resolved_path}")
+            except Exception as e:
+                print(f"Warning: failed to load checkpoint {resolved_path!r}: {e}")
+                print("Falling back to random initialization.")
+                checkpoint = None
+                if model_cfg.get("if_init", True):
+                    model.apply(init_weights)
+        else:
+            print(f"Warning: no checkpoint found for load_path={load_path!r}, training from scratch")
+            if model_cfg.get("if_init", True):
+                model.apply(init_weights)
     elif model_cfg.get("if_init", True):
         model.apply(init_weights)
 
@@ -842,6 +1019,7 @@ def get_model(args, device, cond_dim, default_dt):
 def main(args, path_logs, path_nn, path_record, config_path=""):
 
     device_str = args.device
+    data_cfg = args.data
     if "cuda" in device_str and not torch.cuda.is_available():
         print("! Warning: CUDA not available, using CPU")
         device_str = "cpu"
@@ -914,43 +1092,90 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
     if pf_enable:
         print(f"Pushforward: ON (start={pf_start}, extra_max={pf_extra_max}, ramp={pf_ramp})")
 
-    # ---- Adaptive checkpoint threshold ----
-    # Probe with the MAXIMUM horizon that will ever be used during training:
-    # base horizon + pushforward extra steps (if enabled).  This ensures the
-    # threshold is valid for the hardest epoch, not just the early easy ones.
+    # ---- Adaptive checkpoint threshold (per-horizon table) ----
     horizon_train = args.data.get("horizon_train", 1)
     cfg_ckpt = args.train.get("check_point", False)
     probe_horizon = horizon_train + (pf_extra_max if pf_enable else 0)
+    ckpt_table = None
     if not cfg_ckpt:
-        # Config explicitly disabled checkpointing — skip probe entirely
         print(f"[CKP] check_point disabled in config, skipping probe.")
-        ckpt_threshold = False
     else:
         try:
-            # Find the sample with the most nodes so the probe reflects worst-case memory.
-            # Different files can have different grid shapes, so probing only the first
-            # (random) batch can give an overly optimistic threshold → OOM during training.
             _ds = train_dataloader.dataset
-            if hasattr(_ds, 'dataset'):  # unwrap torch Subset
+            if hasattr(_ds, 'dataset'):
                 _ds = _ds.dataset
+            # Probe must use the actual training batch size — single-sample probe
+            # underestimates memory usage and yields too-optimistic thresholds for bs>1.
+            _train_bs = data_cfg['train'].get("batchsize", 1) if isinstance(data_cfg, dict) else 1
+
+            # Determine max mesh size up-front (also used as cache key component)
+            _max_node_count = 0
+            _max_path = None
             if hasattr(_ds, 'meta_cache') and hasattr(_ds, 'file_paths'):
                 _max_path = max(_ds.file_paths, key=lambda p: _ds.meta_cache[p]["node_pos"].shape[0])
-                _max_idx = next(i for i, (fid, _) in enumerate(_ds.sample_keys)
-                                if _ds.file_paths[fid] == _max_path)
-                print(f"[CKP Probe] Using largest-mesh sample (path={_max_path}, "
-                      f"N={_ds.meta_cache[_max_path]['node_pos'].shape[0]}) for probe.")
-                _first_batch = train_dataloader.collate_fn([_ds[_max_idx]])
+                _max_node_count = _ds.meta_cache[_max_path]["node_pos"].shape[0]
+
+            # ---- Try cache hit before running the expensive probe ----
+            _cache_path = f"{path_record}/{args.name}_ckpt_probe_cache.json"
+            _cache_key, _key_inputs = _compute_probe_cache_key(args, _max_node_count, device)
+            _cached_table, _old_key_inputs = _load_probe_cache(_cache_path, _cache_key)
+
+            if _cached_table is not None:
+                ckpt_table = _cached_table
+                _hit_msg = (f"[CKP Cache] HIT (key={_cache_key}, "
+                            f"file={_cache_path})\n[CKP Cache] Cached per-horizon table:\n"
+                            f"{_format_ckpt_table(ckpt_table)}")
+                print(_hit_msg)
+                try:
+                    with open(f"{path_record}/{args.name}_training_log.txt", "a") as _f:
+                        _f.write(_hit_msg + "\n")
+                except OSError:
+                    pass
             else:
-                _first_batch = next(iter(train_dataloader))
-            ckpt_threshold = _probe_ckpt_threshold(
-                model, _first_batch, device, probe_horizon, args,
-                path_record=path_record, run_name=args.name
-            )
-            del _first_batch
-            torch.cuda.empty_cache()
+                if _old_key_inputs is not None:
+                    print(f"[CKP Cache] MISS (cache key changed: "
+                          f"{_diff_key_inputs(_old_key_inputs, _key_inputs)}), re-probing.")
+                else:
+                    print(f"[CKP Cache] MISS (no cache at {_cache_path}), probing fresh.")
+
+                if _max_path is not None and hasattr(_ds, 'meta_cache') and hasattr(_ds, 'file_paths'):
+                    # Collect up to _train_bs sample indices that share the largest mesh
+                    _max_indices = [i for i, (fid, _) in enumerate(_ds.sample_keys)
+                                    if _ds.file_paths[fid] == _max_path][:_train_bs]
+                    if not _max_indices:
+                        _max_indices = [next(i for i, (fid, _) in enumerate(_ds.sample_keys)
+                                              if _ds.file_paths[fid] == _max_path)]
+                    print(f"[CKP Probe] Using largest-mesh sample (path={_max_path}, "
+                          f"N={_max_node_count}, probe_bs={len(_max_indices)}) for probe.")
+                    _first_batch = train_dataloader.collate_fn([_ds[i] for i in _max_indices])
+                else:
+                    _first_batch = next(iter(train_dataloader))
+                ckpt_table = _probe_ckpt_threshold(
+                    model, _first_batch, device, probe_horizon, args,
+                    path_record=path_record, run_name=args.name,
+                    optimizer=optimizer, normalizer=normalizer,
+                )
+                del _first_batch
+                torch.cuda.empty_cache()
+
+                # Persist for future runs
+                if ckpt_table is not None:
+                    _save_probe_cache(_cache_path, _cache_key, _key_inputs, ckpt_table)
+                    print(f"[CKP Cache] Saved to {_cache_path}")
         except Exception as _probe_exc:
             print(f"[CKP Probe] Probing failed ({_probe_exc}), falling back to config check_point.")
-            ckpt_threshold = True  # fall back to config
+            ckpt_table = None
+
+    def _get_ckpt_threshold(actual_horizon):
+        """Look up the optimal checkpoint threshold for a given rollout length."""
+        if ckpt_table is None:
+            return False if not cfg_ckpt else True
+        if actual_horizon in ckpt_table:
+            return ckpt_table[actual_horizon]
+        closest = min(ckpt_table.keys(), key=lambda h: (h < actual_horizon, abs(h - actual_horizon)))
+        if closest >= actual_horizon:
+            return ckpt_table[closest]
+        return ckpt_table.get(max(ckpt_table.keys()), True)
 
     # ---- Resume ----
     start_epoch, best_val_error = 0, float("inf")
@@ -971,7 +1196,7 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         if 'best_val_error' in checkpoint:
             best_val_error = checkpoint['best_val_error']
             print(f"Restored best val error: {best_val_error:.4e}")
-
+            
     if start_epoch >= EPOCH:
         print(f"Warning: Start epoch {start_epoch} >= Total EPOCH {EPOCH}. Training may perform 0 steps.")
 
@@ -980,9 +1205,9 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         file.write(f"Scheduler: {sched_type}\n")
         file.write(f"EMA: decay=0.998\n")
         file.write(f"Pushforward: enable={pf_enable}\n")
-        file.write(f"grad_loss_weight: {args.train.get('grad_loss_weight', 8.0)}\n")
+        file.write(f"grad_loss_multiplier: {args.train.get('weight_loss', {}).get('grad_loss_multiplier', 8.0)}\n")
         file.write(f"AMP: bf16 autocast (no GradScaler)\n")
-        file.write(f"ckpt_threshold: {ckpt_threshold} (probe_horizon={probe_horizon}, base={horizon_train})\n")
+        file.write(f"ckpt_table: {ckpt_table} (probe_horizon={probe_horizon}, base={horizon_train})\n")
 
     # ---- Early-stop on repeated NaN/skip failures ----
     consecutive_skip_errors = 0
@@ -1021,7 +1246,6 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         interrupt_path = f"{path_nn}/{args.name}_interrupt_ep{interrupt_epoch}_{curtime}.pt"
         torch.save(ckpt, interrupt_path)
         return interrupt_path
-
     # ==================== Training Loop ====================
     for epoch in range(start_epoch, EPOCH):
         start_time = time.time()
@@ -1037,11 +1261,14 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         # Train
         try:
             if use_pushforward:
+                actual_horizon = horizon_train + pf_extra
+                ckpt_threshold = _get_ckpt_threshold(actual_horizon)
                 train_error = train_pushforward(
                     args, model, train_dataloader, optimizer, device, normalizer,
                     extra_steps=pf_extra, ema=ema, ckpt_threshold=ckpt_threshold
                 )
             else:
+                ckpt_threshold = _get_ckpt_threshold(horizon_train)
                 train_error = train_v2(
                     args, model, train_dataloader, optimizer, device, normalizer,
                     ema=ema, ckpt_threshold=ckpt_threshold
