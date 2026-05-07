@@ -6,7 +6,6 @@ data
 config
 paper-0
 paper/mds
-src/paint
 *.vtk
 *.json
 *.pdf
