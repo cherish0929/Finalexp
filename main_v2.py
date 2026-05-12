@@ -1,17 +1,17 @@
 """
-main_v2.py — 改进训练流程
+main_v2.py — Improved training pipeline
 ============================================================
-相比 main.py 的改进：
-1. Warmup + CosineAnnealingWarmRestarts 调度器
-   - 前 warmup_epochs 线性增长 LR，避免初期震荡
-   - 多周期余弦退火 (T_0, T_mult) 帮助逃出局部最优
-2. 更合理的 weight_decay (1e-4 vs 1e-5)
-3. 可配置的 gradient loss 权重 (默认 5.0 vs 硬编码 8.0)
-4. Pushforward training: 训练中后期逐步增加 rollout 步数
-   - 缓解 autoregressive error accumulation
-5. EMA (Exponential Moving Average) 模型，验证时使用 EMA 权重
-6. 更频繁的 eval (每 10 epoch)
-7. 支持从上一个 best checkpoint 继续训练
+Compared to main.py, adds:
+1. Warmup + CosineAnnealingWarmRestarts scheduler
+   - Warmup epochs linearly increase LR to avoid early oscillations
+   - Multi-cycle cosine annealing (T_0, T_mult) helps escape local minima
+2. More reasonable weight_decay (1e-4 vs 1e-5)
+3. Configurable gradient loss weight (default 5.0 vs hardcoded 8.0)
+4. Pushforward training: gradually increases rollout steps during training
+   - Mitigates autoregressive error accumulation
+5. EMA (Exponential Moving Average) model, used for validation
+6. More frequent eval (every N epochs, configurable)
+7. Supports resuming from a previous best checkpoint
 ============================================================
 """
 
@@ -35,866 +35,36 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 
 from src.dataset import AeroGtoDataset, AeroGtoDataset2D, CutAeroGtoDataset, LPBFLaserDataset
-from src.train import train, validate, get_train_loss, _init_region_agg, _accumulate_region, _finalize_region
+from src.train import (
+    train, validate, get_train_loss,
+    _init_region_agg, _accumulate_region, _finalize_region,
+    _REGION_PREFIXES, _REGION_MEANS,
+    train_v2, train_pushforward,
+)
 from src.utils import set_seed, init_weights, parse_args, load_json_config, _resolve_model_path
+from src.utils.ema import EMA
+from src.utils.scheduler import WarmupCosineScheduler
+from src.utils.logging import write_error
+from src.utils.data import worker_init_fn
+from src.utils.ckpt_probe import (
+    _compute_probe_cache_key,
+    _ckpt_table_to_json,
+    _ckpt_table_from_json,
+    _format_ckpt_table,
+    _diff_key_inputs,
+    _load_probe_cache,
+    _save_probe_cache,
+    probe_ckpt_threshold,
+)
+
+# Alias for backward-compatible internal use
+_write_error = write_error
+_worker_init_fn = worker_init_fn
 
 
 # =============================================================================
-# Error logging helpers
+# DataLoader
 # =============================================================================
-
-def _write_error(path_record, args_name, exc, context="", config_path=""):
-    """Write exception info to both training_log.txt and a dedicated bug.txt."""
-    timestamp = time.asctime(time.localtime(time.time()))
-    tb_str = traceback.format_exc()
-
-    # ---- training_log.txt (brief) ----
-    try:
-        log_path = f"{path_record}/{args_name}_training_log.txt"
-        with open(log_path, "a") as f:
-            f.write(f"\n{'='*20} ERROR {'='*20}\n")
-            f.write(f"Time: {timestamp}\n")
-            if context:
-                f.write(f"Context: {context}\n")
-            f.write(f"{tb_str}\n")
-    except Exception:
-        pass  # avoid recursive error
-
-    # ---- bug.txt (detailed) ----
-    try:
-        bug_path = f"{path_record}/bug.txt"
-        with open(bug_path, "a") as f:
-            f.write(f"\n{'='*60}\n")
-            f.write(f"Time      : {timestamp}\n")
-            f.write(f"Config    : {config_path}\n")
-            f.write(f"Run name  : {args_name}\n")
-            if context:
-                f.write(f"Context   : {context}\n")
-            f.write(f"Exception : {type(exc).__name__}: {exc}\n")
-            f.write(f"Traceback :\n{tb_str}\n")
-    except Exception:
-        pass
-
-
-# =============================================================================
-# EMA (Exponential Moving Average)
-# =============================================================================
-
-class EMA:
-    """Maintains an exponential moving average of model parameters.
-
-    IMPORTANT: call update() after every optimizer step (every batch),
-    not once per epoch.  With decay=0.999 the effective averaging window
-    is ~1000 steps.  If called only once per epoch (e.g. 192 batches/epoch),
-    after 100 epochs the shadow still retains >90% of the *initial* weights,
-    producing catastrophically bad inference.
-    """
-    def __init__(self, model, decay=0.999):
-        self.decay = decay
-        self.shadow = {}
-        self.backup = {}
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-
-    @torch.no_grad()
-    def update(self, model):
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                # 原位更新，避免每次 update 都 clone 一份新张量
-                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
-
-    def apply_shadow(self, model):
-        """Replace model params with EMA shadow (for evaluation)."""
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.backup[name] = param.data
-                param.data = self.shadow[name].clone()
-
-    def restore(self, model):
-        """Restore original model params after evaluation."""
-        for name, param in model.named_parameters():
-            if param.requires_grad and name in self.backup:
-                param.data = self.backup[name]
-        self.backup = {}
-
-
-# =============================================================================
-# LPBF autoregressive helper
-# =============================================================================
-
-def _autoregressive_lpbf(model, state0, node_pos, edges, time_seq, spatial_inform,
-                          conditions, dt, check_point, batch, device):
-    """Calls model.autoregressive with LPBF-specific extras extracted from batch."""
-    node_pos_abs  = batch.get("node_pos_abs")
-    laser_params  = batch.get("laser_params")
-    laser_traj    = batch.get("laser_traj")
-    abs_time_seq  = batch.get("abs_time_seq")
-
-    T = time_seq.shape[1]
-
-    if laser_traj is not None:
-        laser_traj   = laser_traj[:, :T+1].to(device)
-    if abs_time_seq is not None:
-        abs_time_seq = abs_time_seq[:, :T+1].to(device)
-    if node_pos_abs is not None:
-        node_pos_abs = node_pos_abs.to(device)
-    if laser_params is not None:
-        laser_params = laser_params.to(device).float()
-
-    return model.autoregressive(
-        state0, node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point,
-        node_pos_abs=node_pos_abs, laser_params=laser_params,
-        laser_traj=laser_traj, abs_time_seq=abs_time_seq,
-    )
-
-
-# =============================================================================
-# Warmup + CosineRestart Scheduler
-# =============================================================================
-
-class WarmupCosineScheduler:
-    """
-    Linear warmup followed by CosineAnnealingLR (monotonic decay).
-
-    Previous WarmupCosineRestartScheduler used CosineAnnealingWarmRestarts which
-    caused lr to bounce back to near-initial values late in training (e.g. epoch
-    160+/200 with T_0=50, T_mult=2), preventing fine-grained convergence and
-    causing severe overfitting (test L2 14x worse than main.py baseline).
-
-    This version uses a single cosine decay after warmup, ensuring lr decreases
-    monotonically to eta_min by the end of training.
-    """
-    def __init__(self, optimizer, warmup_epochs, total_epochs, eta_min=1e-6):
-        self.optimizer = optimizer
-        self.warmup_epochs = warmup_epochs
-        self.base_lr = optimizer.param_groups[0]['lr']
-        self.eta_min = eta_min
-        self.current_epoch = 0
-
-        # Cosine scheduler covers the post-warmup portion
-        self.cosine_scheduler = CosineAnnealingLR(
-            optimizer, T_max=max(1, total_epochs - warmup_epochs), eta_min=eta_min
-        )
-
-    def step(self):
-        self.current_epoch += 1
-        if self.current_epoch <= self.warmup_epochs:
-            lr = self.base_lr * (self.current_epoch / self.warmup_epochs)
-            for pg in self.optimizer.param_groups:
-                pg['lr'] = lr
-        else:
-            self.cosine_scheduler.step()
-
-    def get_last_lr(self):
-        return [pg['lr'] for pg in self.optimizer.param_groups]
-
-    def state_dict(self):
-        return {
-            "current_epoch": self.current_epoch,
-            "cosine_scheduler": self.cosine_scheduler.state_dict(),
-        }
-
-    def load_state_dict(self, state):
-        self.current_epoch = state["current_epoch"]
-        self.cosine_scheduler.load_state_dict(state["cosine_scheduler"])
-
-
-# =============================================================================
-# Pushforward Training
-# =============================================================================
-
-def train_pushforward(args, model, train_dataloader, optim, device, normalizer, extra_steps, ema=None, ckpt_threshold=None):
-    """
-    Pushforward training: extend rollout beyond horizon_train by extra_steps.
-    Only backpropagate through the extra steps (the model is already good at the original horizon).
-    This forces the model to learn to correct its own errors.
-    """
-    from torch.amp import autocast
-
-    base_horizon = args.data.get("horizon_train", 1)
-    fields = args.data.get("fields", ["T"])
-    use_amp = args.train.get("use_amp", False)
-    # ckpt_threshold overrides config check_point when provided
-    check_point = ckpt_threshold if ckpt_threshold is not None else args.train.get("check_point", False)
-    weight_loss = args.train.get("weight_loss", {"enable": False})
-    model_name = args.model.get("name", "PhysGTO")
-
-    agg = {}
-    for key in ["loss", "L2", "mean_l2", "RMSE"]:
-        if key == "L2" or key == "RMSE":
-            for fname in fields:
-                agg[f"{key}_{fname}"] = 0.0
-        else:
-            agg[key] = 0.0
-    agg["each_l2"] = torch.zeros(base_horizon, device=device)
-    agg["num"] = 0
-    agg["value_loss"] = 0.0
-    agg["grad_loss"] = 0.0
-    has_region = False
-
-    model.train()
-    normalizer.to(device)
-
-    _use_lpbf   = model_name == "gto_lpbf"
-    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max", "gto_lpbf")
-
-    pbar = tqdm(train_dataloader, desc="  Train(PF)", unit="bt", leave=True, ncols=120, colour='cyan')
-
-    for batch in pbar:
-        dt = batch['dt'].to(device)
-        state_cpu = batch["state"]           # [B, T+1, N, C] — stay on CPU until T_pf known
-        node_pos = batch["node_pos"].to(device)
-        edges = batch["edges"].to(device)
-        time_seq_cpu = batch["time_seq"]     # [B, T, 1] — stay on CPU until T_pf known
-        if _use_spatial:
-            spatial_inform = batch["spatial_inform"].to(device)
-        conditions = batch["conditions"].to(device).float()
-        if weight_loss.get("gradient", False):
-            weight_loss["grid_shape"] = batch['grid_shape'].numpy()
-
-        active_mask = batch.get("active_mask")
-        if active_mask is not None:
-            active_mask = active_mask[:, 1:].to(device)
-            if not has_region:
-                _init_region_agg(agg, fields)
-                has_region = True
-
-        batch_num = state_cpu.shape[0]
-        T_total = time_seq_cpu.shape[1]
-        T_pf = min(base_horizon + extra_steps, T_total)
-
-        # Transfer only needed slices to device
-        state = state_cpu[:, :T_pf + 1].to(device)
-        time_seq = time_seq_cpu[:, :T_pf].to(device)
-
-        # Slice active_mask for base horizon
-        base_mask = active_mask[:, :base_horizon] if active_mask is not None else None
-
-        if use_amp:
-            with autocast(device_type="cuda", dtype=torch.bfloat16):
-                if _use_lpbf:
-                    predict_hat = _autoregressive_lpbf(
-                        model, state[:, 0], node_pos, edges, time_seq[:, :T_pf],
-                        spatial_inform, conditions, dt, check_point, batch, device)
-                elif _use_spatial:
-                    predict_hat = model.autoregressive(
-                        state[:, 0], node_pos, edges, time_seq[:, :T_pf], spatial_inform, conditions, dt, check_point)
-                else:
-                    predict_hat = model.autoregressive(
-                        state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, check_point)
-                # Loss on original horizon
-                costs = get_train_loss(fields, predict_hat[:, :base_horizon], state[:, 1:base_horizon+1], normalizer, weight_loss, active_mask=base_mask)
-                loss_base = costs["loss"]
-
-                # Loss on extra steps (pushforward)
-                if T_pf > base_horizon and state.shape[1] > base_horizon + 1:
-                    T_extra = min(T_pf, state.shape[1] - 1)
-                    pf_mask = active_mask[:, base_horizon:T_extra] if active_mask is not None else None
-                    costs_pf = get_train_loss(
-                        fields, predict_hat[:, base_horizon:T_extra],
-                        state[:, base_horizon+1:T_extra+1], normalizer, weight_loss, active_mask=pf_mask
-                    )
-                    loss_pf = costs_pf["loss"]
-                    total_loss = loss_base + 0.5 * loss_pf  # pushforward weighted less
-                else:
-                    total_loss = loss_base
-
-            # NaN guard / Loss spike guard: 跳过异常 batch，并释放计算图显存
-            _skip = False
-            if not torch.isfinite(total_loss):
-                _skip = True
-            else:
-                _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
-                if _cur_avg is not None and total_loss.item() > 10 * _cur_avg:
-                    _skip = True
-            if _skip:
-                optim.zero_grad()
-                del predict_hat, costs, loss_base, total_loss
-                if 'costs_pf' in locals(): del costs_pf, loss_pf
-                torch.cuda.empty_cache()
-                continue
-
-            # bf16 autocast without GradScaler
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
-            # Skip step if any gradient is non-finite
-            if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
-                optim.zero_grad()
-                del predict_hat, costs, loss_base, total_loss
-                if 'costs_pf' in locals(): del costs_pf, loss_pf
-                torch.cuda.empty_cache()
-                continue
-            optim.step()
-            optim.zero_grad()
-            if ema is not None:
-                ema.update(model)
-        else:
-            if _use_lpbf:
-                predict_hat = _autoregressive_lpbf(
-                    model, state[:, 0], node_pos, edges, time_seq[:, :T_pf],
-                    spatial_inform, conditions, dt, check_point, batch, device)
-            elif _use_spatial:
-                predict_hat = model.autoregressive(
-                    state[:, 0], node_pos, edges, time_seq[:, :T_pf], spatial_inform, conditions, dt, check_point
-                )
-            else:
-                predict_hat = model.autoregressive(
-                    state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, check_point
-                )
-            costs = get_train_loss(fields, predict_hat[:, :base_horizon], state[:, 1:base_horizon+1], normalizer, weight_loss, active_mask=base_mask)
-            loss_base = costs["loss"]
-
-            if T_pf > base_horizon and state.shape[1] > base_horizon + 1:
-                T_extra = min(T_pf, state.shape[1] - 1)
-                pf_mask = active_mask[:, base_horizon:T_extra] if active_mask is not None else None
-                costs_pf = get_train_loss(
-                    fields, predict_hat[:, base_horizon:T_extra],
-                    state[:, base_horizon+1:T_extra+1], normalizer, weight_loss, active_mask=pf_mask
-                )
-                loss_pf = costs_pf["loss"]
-                total_loss = loss_base + 0.5 * loss_pf
-            else:
-                total_loss = loss_base
-
-            # NaN guard / Loss spike guard
-            _skip = False
-            if not torch.isfinite(total_loss):
-                _skip = True
-            else:
-                _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
-                if _cur_avg is not None and total_loss.item() > 10 * _cur_avg:
-                    _skip = True
-            if _skip:
-                optim.zero_grad()
-                del predict_hat, costs, loss_base, total_loss
-                if 'costs_pf' in locals(): del costs_pf, loss_pf
-                torch.cuda.empty_cache()
-                continue
-
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
-            # Skip step if any gradient is non-finite
-            if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
-                optim.zero_grad()
-                del predict_hat, costs, loss_base, total_loss
-                if 'costs_pf' in locals(): del costs_pf, loss_pf
-                torch.cuda.empty_cache()
-                continue
-            optim.step()
-            optim.zero_grad()
-            if ema is not None:
-                ema.update(model)
-
-        agg["loss"] += costs["loss"].item() * batch_num
-        agg["value_loss"] += costs["value_loss"].item() * batch_num
-        agg["grad_loss"] += costs["grad_loss"].item() * batch_num
-
-        for fname in fields:
-            agg[f"L2_{fname}"] += costs[f"L2_{fname}"].mean().item() * batch_num
-            agg[f"RMSE_{fname}"] += costs[f"RMSE_{fname}"] * batch_num
-        agg["mean_l2"] += costs["mean_l2"].mean().item() * batch_num
-        agg["each_l2"] += costs["each_l2"] * batch_num
-        agg["num"] += batch_num
-
-        if has_region:
-            _accumulate_region(agg, costs, batch_num, fields, include_loss=True)
-
-        avg_loss = agg["loss"] / agg["num"]
-        pbar.set_postfix({"Loss": f"{avg_loss:.4e}"})
-
-    from src.train import _REGION_PREFIXES, _REGION_MEANS
-    for key, value in agg.items():
-        if key != "each_l2" and key != "num" and not key.endswith("_cnt"):
-            if key not in ("active_loss", "inactive_loss") and key not in _REGION_MEANS and not any(key.startswith(p + "_") for p in _REGION_PREFIXES):
-                agg[key] = value / agg["num"]
-
-    agg["each_l2"] = (agg["each_l2"] / agg["num"]).cpu()
-    if has_region:
-        _finalize_region(agg, fields, agg["num"], include_loss=True)
-    return agg
-
-
-# =============================================================================
-# Patched train function with configurable grad_loss_weight
-# =============================================================================
-
-def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None, ckpt_threshold=None):
-    """train() with configurable grad_loss_weight instead of hardcoded 8.0"""
-    from torch.amp import autocast
-
-    horizon = args.data.get("horizon_train", 1) if isinstance(args.data, dict) else getattr(args, "horizon_train", 1)
-    fields = args.data.get("fields", ["T"])
-    use_amp = args.train.get("use_amp", False)
-    # ckpt_threshold overrides config check_point when provided (set by _probe_ckpt_threshold)
-    check_point = ckpt_threshold if ckpt_threshold is not None else args.train.get("check_point", False)
-    weight_loss = args.train.get("weight_loss", {"enable": False})
-    model_name = args.model.get("name", "PhysGTO")
-
-    agg = {}
-    for key in ["loss", "L2", "mean_l2", "RMSE"]:
-        if key == "L2" or key == "RMSE":
-            for fname in fields:
-                agg[f"{key}_{fname}"] = 0.0
-        else:
-            agg[key] = 0.0
-    agg["each_l2"] = torch.zeros(horizon, device=device)
-    agg["num"] = 0
-    agg["value_loss"] = 0.0
-    agg["grad_loss"] = 0.0
-    has_region = False
-
-    model.train()
-    normalizer.to(device)
-
-    _use_lpbf   = model_name == "gto_lpbf"
-    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max", "gto_lpbf")
-
-    pbar = tqdm(train_dataloader, desc="  Train", unit="bt", leave=True, ncols=120, colour='green')
-    for batch in pbar:
-        dt = batch['dt'].to(device)
-        state = batch["state"][:, :horizon + 1].to(device)
-        node_pos = batch["node_pos"].to(device)
-        edges = batch["edges"].to(device)
-        time_seq = batch["time_seq"][:, :horizon].to(device)
-        if _use_spatial:
-            spatial_inform = batch["spatial_inform"].to(device)
-        conditions = batch["conditions"].to(device).float()
-        if weight_loss.get("gradient", False):
-            weight_loss["grid_shape"] = batch['grid_shape'].numpy()
-
-        active_mask = batch.get("active_mask")
-        if active_mask is not None:
-            active_mask = active_mask[:, 1:horizon + 1].to(device)
-            if not has_region:
-                _init_region_agg(agg, fields)
-                has_region = True
-
-        batch_num = state.shape[0]
-
-        if use_amp:
-            with autocast(device_type="cuda", dtype=torch.bfloat16):
-                if _use_lpbf:
-                    predict_hat = _autoregressive_lpbf(
-                        model, state[:, 0], node_pos, edges, time_seq,
-                        spatial_inform, conditions, dt, check_point, batch, device)
-                elif _use_spatial:
-                    predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point)
-                else:
-                    predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
-
-                costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss, active_mask=active_mask)
-
-            # Use costs["loss"] which already applies grad_loss_multiplier from weight_loss config
-            loss = costs["loss"]
-
-            # NaN guard / Loss spike guard: 跳过异常 batch，并释放计算图显存
-            _skip = False
-            if not torch.isfinite(loss):
-                _skip = True
-            else:
-                _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
-                if _cur_avg is not None and loss.item() > 10 * _cur_avg:
-                    _skip = True
-            if _skip:
-                optim.zero_grad()
-                del predict_hat, costs, loss
-                torch.cuda.empty_cache()
-                continue
-
-            # bf16 autocast without GradScaler — more stable than fp16+scaler
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
-            # Skip step if any gradient is non-finite (prevents corrupting weights)
-            if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
-                optim.zero_grad()
-                del predict_hat, costs, loss
-                torch.cuda.empty_cache()
-                continue
-            optim.step()
-            optim.zero_grad()
-            if ema is not None:
-                ema.update(model)
-        else:
-            if _use_lpbf:
-                predict_hat = _autoregressive_lpbf(
-                    model, state[:, 0], node_pos, edges, time_seq,
-                    spatial_inform, conditions, dt, check_point, batch, device)
-            elif _use_spatial:
-                predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point)
-            else:
-                predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
-
-            costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss, active_mask=active_mask)
-
-            loss = costs["loss"]
-
-            # NaN guard / Loss spike guard
-            _skip = False
-            if not torch.isfinite(loss):
-                _skip = True
-            else:
-                _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
-                if _cur_avg is not None and loss.item() > 10 * _cur_avg:
-                    _skip = True
-            if _skip:
-                optim.zero_grad()
-                del predict_hat, costs, loss
-                torch.cuda.empty_cache()
-                continue
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
-            # Skip step if any gradient is non-finite
-            if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
-                optim.zero_grad()
-                del predict_hat, costs, loss
-                torch.cuda.empty_cache()
-                continue
-            optim.step()
-            optim.zero_grad()
-            if ema is not None:
-                ema.update(model)
-
-        # For logging, store the combined loss into costs
-        costs["loss"] = loss
-
-        agg["loss"] += costs["loss"].item() * batch_num
-        agg["value_loss"] += costs["value_loss"].item() * batch_num
-        agg["grad_loss"] += costs["grad_loss"].item() * batch_num
-
-        for fname in fields:
-            agg[f"L2_{fname}"] += costs[f"L2_{fname}"].mean().item() * batch_num
-            agg[f"RMSE_{fname}"] += costs[f"RMSE_{fname}"] * batch_num
-        agg["mean_l2"] += costs["mean_l2"].mean().item() * batch_num
-        agg["each_l2"] += costs["each_l2"] * batch_num
-        agg["num"] += batch_num
-
-        if has_region:
-            _accumulate_region(agg, costs, batch_num, fields, include_loss=True)
-
-        avg_loss = agg["loss"] / agg["num"]
-        pbar.set_postfix({"Loss": f"{avg_loss:.4e}"})
-
-    from src.train import _REGION_PREFIXES, _REGION_MEANS
-    if agg["num"] == 0:
-        raise RuntimeError(
-            "train_v2: all batches were skipped (NaN/spike guard triggered every batch). "
-            "Loss is NaN or Inf — check for gradient explosion or bad input data."
-        )
-    for key, value in agg.items():
-        if key != "each_l2" and key != "num" and not key.endswith("_cnt"):
-            if key not in ("active_loss", "inactive_loss") and key not in _REGION_MEANS and not any(key.startswith(p + "_") for p in _REGION_PREFIXES):
-                agg[key] = value / agg["num"]
-
-    agg["each_l2"] = (agg["each_l2"] / agg["num"]).cpu()
-    if has_region:
-        _finalize_region(agg, fields, agg["num"], include_loss=True)
-    return agg
-
-
-# =============================================================================
-# Adaptive checkpoint threshold probing  (per-horizon table + disk cache)
-# =============================================================================
-
-def _compute_probe_cache_key(args, max_node_count, device):
-    """构建 probe 缓存键。返回 (16字符 sha256 哈希, key_inputs dict)。"""
-    model_cfg = dict(args.model) if isinstance(args.model, dict) else dict(vars(args.model))
-    model_cfg.pop("load_path", None)
-
-    pf_cfg = args.train.get("pushforward", {"enable": False}) if isinstance(args.train, dict) else {}
-    data_cfg = args.data if isinstance(args.data, dict) else {}
-    train_cfg = data_cfg.get("train", {}) if isinstance(data_cfg, dict) else {}
-
-    try:
-        gpu_name = torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu"
-    except Exception:
-        gpu_name = "unknown"
-
-    key_inputs = {
-        "model_cfg": model_cfg,
-        "batchsize": train_cfg.get("batchsize", 1),
-        "horizon_train": data_cfg.get("horizon_train", 1),
-        "pf_enable": bool(pf_cfg.get("enable", False)),
-        "pf_extra_max": int(pf_cfg.get("extra_steps", 0)),
-        "use_amp": bool(args.train.get("use_amp", False)) if isinstance(args.train, dict) else False,
-        "max_node_count": int(max_node_count),
-        "gpu_name": gpu_name,
-        "torch_version": torch.__version__,
-    }
-    blob = json.dumps(key_inputs, sort_keys=True, default=str)
-    cache_key = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
-    return cache_key, key_inputs
-
-
-def _ckpt_table_to_json(table):
-    """ckpt_table 序列化：int key → str；保留 True/False/int value。"""
-    return {str(h): v for h, v in table.items()}
-
-
-def _ckpt_table_from_json(obj):
-    """ckpt_table 反序列化：str key → int；保留 True/False/int value（json 已天然区分）。"""
-    return {int(h): v for h, v in obj.items()}
-
-
-def _format_ckpt_table(table):
-    """格式化 per-horizon 表为多行字符串。"""
-    lines = []
-    for h in sorted(table.keys()):
-        v = table[h]
-        if v is True:
-            lines.append(f"  h={h}: FULL CKP (still OOM risk)")
-        elif v == h:
-            lines.append(f"  h={h}: no ckp")
-        else:
-            lines.append(f"  h={h}: threshold={v} ({v} free + {h - v} ckp)")
-    return "\n".join(lines)
-
-
-def _diff_key_inputs(old, new):
-    """返回 old 与 new 中字段差异的可读字符串，用于解释 cache MISS 原因。"""
-    diffs = []
-    keys = set(old.keys()) | set(new.keys())
-    for k in sorted(keys):
-        ov, nv = old.get(k, "<absent>"), new.get(k, "<absent>")
-        if ov != nv:
-            if k == "model_cfg" and isinstance(ov, dict) and isinstance(nv, dict):
-                sub = sorted(set(ov.keys()) | set(nv.keys()))
-                sub_diffs = [f"{sk}: {ov.get(sk)!r} → {nv.get(sk)!r}"
-                             for sk in sub if ov.get(sk) != nv.get(sk)]
-                if sub_diffs:
-                    diffs.append("model_cfg{ " + ", ".join(sub_diffs) + " }")
-            else:
-                diffs.append(f"{k}: {ov!r} → {nv!r}")
-    return "; ".join(diffs) if diffs else "(no field-level diff, hash collision?)"
-
-
-def _load_probe_cache(cache_path, expected_key):
-    """读取 cache 文件。命中返回 (ckpt_table, key_inputs)；miss/损坏返回 (None, old_key_inputs_or_None)。"""
-    if not os.path.exists(cache_path):
-        return None, None
-    try:
-        with open(cache_path, "r") as f:
-            data = json.load(f)
-        if data.get("version") != 1:
-            return None, data.get("key_inputs")
-        if data.get("key") != expected_key:
-            return None, data.get("key_inputs")
-        return _ckpt_table_from_json(data["ckpt_table"]), data.get("key_inputs")
-    except (json.JSONDecodeError, KeyError, TypeError, OSError) as e:
-        print(f"[CKP Cache] Corrupted cache file ({e}), will re-probe.")
-        try:
-            os.remove(cache_path)
-        except OSError:
-            pass
-        return None, None
-
-
-def _save_probe_cache(cache_path, cache_key, key_inputs, ckpt_table):
-    """原子写入 cache 文件（先写 .tmp 再 rename）。失败仅打印 warning。"""
-    payload = {
-        "version": 1,
-        "key": cache_key,
-        "key_inputs": key_inputs,
-        "ckpt_table": _ckpt_table_to_json(ckpt_table),
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    try:
-        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-        tmp_path = cache_path + ".tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(payload, f, indent=2, default=str)
-        os.replace(tmp_path, cache_path)
-    except OSError as e:
-        print(f"[CKP Cache] Warning: failed to save cache ({e})")
-
-
-# =============================================================================
-# Adaptive checkpoint threshold probing
-# =============================================================================
-
-def _probe_ckpt_threshold(model, first_batch, device, horizon, args, path_record="", run_name="", optimizer=None, normalizer=None):
-    """
-    Build a per-horizon checkpoint threshold table.
-
-    For each possible rollout length h in [1, horizon], binary-search for the
-    maximum number of free (non-checkpointed) steps before OOM.
-
-    Returns a dict  {h: threshold}  where:
-      - threshold == h      → horizon h needs no checkpointing at all
-      - 0 <= threshold < h  → steps [0, threshold) free, [threshold, h) use ckp
-      - threshold is True   → even full ckp OOMs at this horizon (fallback)
-
-    At training time, look up ckpt_table[actual_horizon] to get the optimal
-    threshold for the current epoch's rollout length.
-    """
-    if not torch.cuda.is_available():
-        return {h: False for h in range(1, horizon + 1)}
-    if horizon <= 1:
-        return {1: False}
-
-    from torch.amp import autocast
-
-    use_amp = args.train.get("use_amp", False)
-    model_name = args.model.get("name", "PhysGTO")
-    _use_lpbf   = model_name == "gto_lpbf"
-    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3", "gto_attnres_max", "gto_lpbf")
-
-    dt = first_batch['dt'].to(device)
-    state_full = first_batch["state"][:, :horizon + 1].to(device)
-    node_pos = first_batch["node_pos"].to(device)
-    edges = first_batch["edges"].to(device)
-    time_seq_full = first_batch["time_seq"][:, :horizon].to(device)
-    conditions = first_batch["conditions"].to(device).float()
-    spatial_inform = None
-    if _use_spatial and "spatial_inform" in first_batch:
-        spatial_inform = first_batch["spatial_inform"].to(device)
-
-    fields = args.data.get("fields", ["T"])
-    weight_loss = args.train.get("weight_loss", {"enable": False})
-    if weight_loss.get("gradient", False) and "grid_shape" in first_batch:
-        weight_loss = dict(weight_loss)
-        weight_loss["grid_shape"] = first_batch["grid_shape"].numpy()
-
-    normalizer_ref = normalizer
-
-    def _try(h, ckpt_val):
-        """Run forward+backward with h steps and given check_point value."""
-        torch.cuda.empty_cache()
-        _state = state_full[:, :h + 1]
-        _time_seq = time_seq_full[:, :h]
-        try:
-            model.train()
-            if use_amp:
-                with autocast(device_type="cuda", dtype=torch.bfloat16):
-                    if _use_lpbf:
-                        out = _autoregressive_lpbf(
-                            model, _state[:, 0], node_pos, edges, _time_seq,
-                            spatial_inform, conditions, dt, ckpt_val, first_batch, device)
-                    elif _use_spatial and spatial_inform is not None:
-                        out = model.autoregressive(_state[:, 0], node_pos, edges, _time_seq,
-                                                   spatial_inform, conditions, dt, ckpt_val)
-                    else:
-                        out = model.autoregressive(_state[:, 0], node_pos, edges, _time_seq,
-                                                   conditions, dt, ckpt_val)
-            else:
-                if _use_lpbf:
-                    out = _autoregressive_lpbf(
-                        model, _state[:, 0], node_pos, edges, _time_seq,
-                        spatial_inform, conditions, dt, ckpt_val, first_batch, device)
-                elif _use_spatial and spatial_inform is not None:
-                    out = model.autoregressive(_state[:, 0], node_pos, edges, _time_seq,
-                                               spatial_inform, conditions, dt, ckpt_val)
-                else:
-                    out = model.autoregressive(_state[:, 0], node_pos, edges, _time_seq,
-                                               conditions, dt, ckpt_val)
-            if normalizer_ref is not None:
-                costs = get_train_loss(fields, out, _state[:, 1:h+1], normalizer_ref, weight_loss)
-                loss = costs["loss"]
-            else:
-                loss = out.float().sum()
-            loss.backward()
-            model.zero_grad(set_to_none=True)
-            del out, loss
-            if normalizer_ref is not None:
-                del costs
-            torch.cuda.empty_cache()
-            return True
-        except torch.cuda.OutOfMemoryError:
-            model.zero_grad(set_to_none=True)
-            torch.cuda.empty_cache()
-            return False
-        except Exception:
-            model.zero_grad(set_to_none=True)
-            torch.cuda.empty_cache()
-            return False
-
-    def _log(msg):
-        print(msg)
-        if path_record and run_name:
-            try:
-                with open(f"{path_record}/{run_name}_training_log.txt", "a") as f:
-                    f.write(msg + "\n")
-            except Exception:
-                pass
-
-    _log(f"[CKP Probe] Building per-horizon checkpoint table (max horizon={horizon}) ...")
-
-    if optimizer is not None and len(optimizer.state) == 0:
-        _log("[CKP Probe] Warming up optimizer state (Adam m/v not yet allocated)...")
-        try:
-            _param_backup = [p.data.clone() for p in model.parameters() if p.requires_grad]
-            model.train()
-            _dummy_loss = sum(p.sum() for p in model.parameters() if p.requires_grad)
-            _dummy_loss.backward()
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            for p, backup in zip((q for q in model.parameters() if q.requires_grad), _param_backup):
-                p.data.copy_(backup)
-            del _param_backup, _dummy_loss
-            torch.cuda.empty_cache()
-            _log("[CKP Probe] Optimizer state allocated.")
-        except Exception as _e:
-            _log(f"[CKP Probe] Optimizer warmup failed ({_e}), continuing without.")
-            model.zero_grad(set_to_none=True)
-            torch.cuda.empty_cache()
-
-    table = {}
-    max_free_from_prev = horizon
-
-    for h in range(horizon, 0, -1):
-        if _try(h, False):
-            table[h] = h
-            _log(f"[CKP Probe]   horizon={h}: no ckp needed (all {h} steps free)")
-            for hh in range(h - 1, 0, -1):
-                table[hh] = hh
-            _log(f"[CKP Probe]   horizon 1~{h-1}: no ckp needed (smaller than {h})")
-            break
-
-        if not _try(h, True):
-            table[h] = True
-            _log(f"[CKP Probe]   horizon={h}: OOM even with full ckp!")
-            continue
-
-        lo, hi = 0, min(h - 1, max_free_from_prev)
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if _try(h, mid):
-                lo = mid
-            else:
-                hi = mid - 1
-
-        safe_lo = max(0, lo - 1)
-        table[h] = safe_lo
-        max_free_from_prev = lo
-        _log(f"[CKP Probe]   horizon={h}: threshold={safe_lo} "
-             f"(steps [0,{safe_lo}) free, [{safe_lo},{h}) ckp)")
-
-    _log("[CKP Probe] Final table:")
-    for h in sorted(table.keys()):
-        v = table[h]
-        if v is True:
-            _log(f"  h={h}: FULL CKP (still OOM risk)")
-        elif v == h:
-            _log(f"  h={h}: no ckp")
-        else:
-            _log(f"  h={h}: threshold={v} ({v} free + {h - v} ckp)")
-
-    return table
-
-
-# =============================================================================
-# DataLoader (same as main.py)
-# =============================================================================
-
-def _worker_init_fn(worker_id, base_seed):
-    """固定每个 DataLoader worker 的随机种子，确保 shuffle 顺序可复现。"""
-    import random as _random
-    seed = base_seed + worker_id
-    np.random.seed(seed)
-    _random.seed(seed)
-    torch.manual_seed(seed)
-
 
 def get_dataloader(args, path_record, device_type, pf_extra_max=0):
     data_cfg = args.data
@@ -904,7 +74,6 @@ def get_dataloader(args, path_record, device_type, pf_extra_max=0):
 
     if model_name == "gto_lpbf":
         Datasetclass = LPBFLaserDataset
-        # Inject fields into model config so build_model can read them
         model_cfg["_fields"] = data_cfg.get("fields", ["T"])
     elif space_dim == 3:
         if data_cfg.get("cut", False):
@@ -914,14 +83,10 @@ def get_dataloader(args, path_record, device_type, pf_extra_max=0):
     else:  # space_dim == 2
         Datasetclass = AeroGtoDataset2D
 
-    # Inject pf_extra_max into data_cfg so train dataset can load extra time steps
     if pf_extra_max > 0:
         data_cfg["horizon_pf_extra"] = pf_extra_max
 
-    train_dataset = Datasetclass(
-        args=args,
-        mode="train"
-    )
+    train_dataset = Datasetclass(args=args, mode="train")
 
     test_dataset = Datasetclass(
         args=args,
@@ -930,9 +95,8 @@ def get_dataloader(args, path_record, device_type, pf_extra_max=0):
     )
 
     test_dataset.normalizer = train_dataset.normalizer
-    test_dataset._sync_norm_cache()  # 同步 norm_mean/norm_std 缓存
+    test_dataset._sync_norm_cache()
 
-    # Use 1/4 of the test set to reduce evaluation time
     subset_size = max(1, len(test_dataset) // 4)
     indices = list(range(0, len(test_dataset), 4))[:subset_size]
     test_dataset = Subset(test_dataset, indices)
@@ -978,6 +142,10 @@ def get_dataloader(args, path_record, device_type, pf_extra_max=0):
 
     return train_dataloader, test_dataloader, train_dataset.normalizer, cond_dim, train_dataset.dt
 
+
+# =============================================================================
+# Model loading
+# =============================================================================
 
 def get_model(args, device, cond_dim, default_dt):
     from src.model import build_model
@@ -1029,7 +197,7 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
     real_lr = float(args.train["lr"])
     fields = args.data.get("fields", ["T"])
 
-    # ---- Pushforward config (parsed early to size the dataset) ----
+    # ---- Pushforward config ----
     pf_cfg = args.train.get("pushforward", {"enable": False})
     pf_enable = pf_cfg.get("enable", False)
     pf_start = pf_cfg.get("start_epoch", 80)
@@ -1078,7 +246,6 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         )
         print(f"Scheduler: WarmupCosine (warmup={warmup_epochs}, total={EPOCH}, eta_min={eta_min:.2e})")
     else:
-        # Fallback: original behavior
         if EPOCH < 50:
             scheduler = CosineAnnealingLR(optimizer, T_max=EPOCH, eta_min=real_lr)
         else:
@@ -1092,7 +259,7 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
     if pf_enable:
         print(f"Pushforward: ON (start={pf_start}, extra_max={pf_extra_max}, ramp={pf_ramp})")
 
-    # ---- Adaptive checkpoint threshold (per-horizon table) ----
+    # ---- Adaptive checkpoint threshold ----
     horizon_train = args.data.get("horizon_train", 1)
     cfg_ckpt = args.train.get("check_point", False)
     probe_horizon = horizon_train + (pf_extra_max if pf_enable else 0)
@@ -1104,18 +271,15 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
             _ds = train_dataloader.dataset
             if hasattr(_ds, 'dataset'):
                 _ds = _ds.dataset
-            # Probe must use the actual training batch size — single-sample probe
-            # underestimates memory usage and yields too-optimistic thresholds for bs>1.
             _train_bs = data_cfg['train'].get("batchsize", 1) if isinstance(data_cfg, dict) else 1
 
-            # Determine max mesh size up-front (also used as cache key component)
             _max_node_count = 0
             _max_path = None
             if hasattr(_ds, 'meta_cache') and hasattr(_ds, 'file_paths'):
                 _max_path = max(_ds.file_paths, key=lambda p: _ds.meta_cache[p]["node_pos"].shape[0])
                 _max_node_count = _ds.meta_cache[_max_path]["node_pos"].shape[0]
 
-            # ---- Try cache hit before running the expensive probe ----
+            # ---- Try cache hit ----
             _cache_path = f"{path_record}/{args.name}_ckpt_probe_cache.json"
             _cache_key, _key_inputs = _compute_probe_cache_key(args, _max_node_count, device)
             _cached_table, _old_key_inputs = _load_probe_cache(_cache_path, _cache_key)
@@ -1139,7 +303,6 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
                     print(f"[CKP Cache] MISS (no cache at {_cache_path}), probing fresh.")
 
                 if _max_path is not None and hasattr(_ds, 'meta_cache') and hasattr(_ds, 'file_paths'):
-                    # Collect up to _train_bs sample indices that share the largest mesh
                     _max_indices = [i for i, (fid, _) in enumerate(_ds.sample_keys)
                                     if _ds.file_paths[fid] == _max_path][:_train_bs]
                     if not _max_indices:
@@ -1150,7 +313,7 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
                     _first_batch = train_dataloader.collate_fn([_ds[i] for i in _max_indices])
                 else:
                     _first_batch = next(iter(train_dataloader))
-                ckpt_table = _probe_ckpt_threshold(
+                ckpt_table = probe_ckpt_threshold(
                     model, _first_batch, device, probe_horizon, args,
                     path_record=path_record, run_name=args.name,
                     optimizer=optimizer, normalizer=normalizer,
@@ -1158,7 +321,6 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
                 del _first_batch
                 torch.cuda.empty_cache()
 
-                # Persist for future runs
                 if ckpt_table is not None:
                     _save_probe_cache(_cache_path, _cache_key, _key_inputs, ckpt_table)
                     print(f"[CKP Cache] Saved to {_cache_path}")
@@ -1196,7 +358,7 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         if 'best_val_error' in checkpoint:
             best_val_error = checkpoint['best_val_error']
             print(f"Restored best val error: {best_val_error:.4e}")
-            
+
     if start_epoch >= EPOCH:
         print(f"Warning: Start epoch {start_epoch} >= Total EPOCH {EPOCH}. Training may perform 0 steps.")
 
@@ -1246,6 +408,7 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         interrupt_path = f"{path_nn}/{args.name}_interrupt_ep{interrupt_epoch}_{curtime}.pt"
         torch.save(ckpt, interrupt_path)
         return interrupt_path
+
     # ==================== Training Loop ====================
     for epoch in range(start_epoch, EPOCH):
         start_time = time.time()
@@ -1306,7 +469,6 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
                          config_path=config_path)
             print(f"[ERROR] Epoch {epoch + 1} training failed: {e}. Skipping epoch.")
             scheduler.step()
-            # Check if this is a repeated all-batches-skipped error
             if "all batches were skipped" in str(e):
                 consecutive_skip_errors += 1
                 if consecutive_skip_errors >= max_consecutive_skip_errors:
@@ -1333,10 +495,7 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
             continue
 
         consecutive_skip_errors = 0
-
         end_time = time.time()
-
-        # EMA is now updated per-batch inside train_v2/train_pushforward
 
         # Step scheduler
         scheduler.step()
@@ -1417,7 +576,6 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
             start_time = time.time()
 
             try:
-                # Apply EMA weights for evaluation
                 torch.cuda.empty_cache()
                 ema.apply_shadow(model)
                 test_error = validate(args, model, test_dataloader, device, normalizer, epoch + 1)

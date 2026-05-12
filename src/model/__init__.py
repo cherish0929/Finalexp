@@ -124,5 +124,6 @@ def build_model(model_cfg: dict, cond_dim: int, default_dt: float, device):
         kwargs["balance_weight"]  = model_cfg.get("balance_weight", 0.05)
         kwargs["sharp_weight"]    = model_cfg.get("sharp_weight", 0.01)
         kwargs["stepper_scheme"]  = model_cfg.get("stepper_scheme", "euler")
+        kwargs["physics_params"]  = model_cfg.get("physics_params", None)
 
     return ModelClass(**kwargs).to(device)
