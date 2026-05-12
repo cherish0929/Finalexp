@@ -55,12 +55,11 @@ CONFIG_LIST = [
 ]
 
 CONFIG_LIST = [
-    "config/keyhole/GTO_keyhole_stronger.json",
-    "config/keyhole/GTO_attnres_keyhole_stronger.json",
-    "config/keyhole/GTO_attnres_3_keyhole_stronger.json",
-    "config/keyhole/time_stride2/GTO_keyhole_stronger_time_stride2.json",
-    "config/keyhole/time_stride2/GTO_attnres_keyhole_stronger_time_stride2.json",
-    "config/keyhole/time_stride2/GTO_attnres_3_keyhole_stronger_time_stride2.json"
+    "config/new_liquid/easypool/GTO_a3_ep_s_liquid.json",
+    "config/new_liquid/easypool/GTO_a3_ep_s_T_liquid.json",
+    "config/new_liquid/easypool/GTO_ep_s_T_liquid.json",
+    "config/new_liquid/keyhole/GTO_a3_kh_s_liquid.json",
+    "config/new_liquid/keyhole/GTO_a3_kh_s_T_liquid.json"
 ]
 
 
@@ -103,8 +102,8 @@ def get_dataloader_eval(args, device_type):
     elif space_dim == 2:
         Datasetclass = AeroGtoDataset2D
 
-    # args.data["test_list"] = ["./data/con_kh/val_con_kh.txt"]
-    step = 4
+    args.data["test_list"] = args.data["eval_list"]
+    step = 3
 
     train_dataset = Datasetclass(args=args, mode="train")
 
@@ -445,7 +444,7 @@ def main():
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     # report_path = f"result_easypool/evaluate/report_{timestamp}.txt"
-    report_path = f"evaluate/report_keyhole.txt"
+    report_path = f"evaluate/report_keyhole_{timestamp}.txt"
     logger = DualLogger(report_path)
 
     logger.log(f"{'#'*70}")
