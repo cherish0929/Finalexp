@@ -227,7 +227,7 @@ def _compute_normal_consistency(
     gt_norm_sq = gt_gx ** 2 + gt_gy ** 2 + gt_gz ** 2
 
     dot = pred_gx * gt_gx + pred_gy * gt_gy + pred_gz * gt_gz
-    cos = dot / (torch.sqrt(pred_norm_sq * gt_norm_sq) + 1e-8)
+    cos = dot / (torch.sqrt(pred_norm_sq * gt_norm_sq + 1e-8) + 1e-8)
 
     return (1.0 - cos).mean()
 

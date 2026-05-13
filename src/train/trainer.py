@@ -40,6 +40,7 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
     _has_aux = model_name == "gto_lpbf"
 
     pbar = tqdm(train_dataloader, desc="  Train", unit="bt", leave=True, ncols=120, colour='green')
+    _n_skip = 0
     for batch in pbar:
         dt = batch['dt'].to(device)
         state = batch["state"][:, :horizon + 1].to(device)
@@ -90,6 +91,8 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
                 if _cur_avg is not None and loss.item() > 10 * _cur_avg:
                     _skip = True
             if _skip:
+                _n_skip += 1
+                pbar.set_postfix({"Loss": "NaN/skip", "skip": _n_skip})
                 optim.zero_grad()
                 del predict_hat, costs, loss
                 torch.cuda.empty_cache()
@@ -98,6 +101,8 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
             if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
+                _n_skip += 1
+                pbar.set_postfix({"Loss": "grad NaN", "skip": _n_skip})
                 optim.zero_grad()
                 del predict_hat, costs, loss
                 torch.cuda.empty_cache()
@@ -132,6 +137,8 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
                 if _cur_avg is not None and loss.item() > 10 * _cur_avg:
                     _skip = True
             if _skip:
+                _n_skip += 1
+                pbar.set_postfix({"Loss": "NaN/skip", "skip": _n_skip})
                 optim.zero_grad()
                 del predict_hat, costs, loss
                 torch.cuda.empty_cache()
@@ -140,6 +147,8 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
             if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
+                _n_skip += 1
+                pbar.set_postfix({"Loss": "grad NaN", "skip": _n_skip})
                 optim.zero_grad()
                 del predict_hat, costs, loss
                 torch.cuda.empty_cache()
@@ -166,7 +175,10 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None,
             _accumulate_region(agg, costs, batch_num, fields, include_loss=True)
 
         avg_loss = agg["loss"] / agg["num"]
-        pbar.set_postfix({"Loss": f"{avg_loss:.4e}"})
+        _postfix = {"Loss": f"{avg_loss:.4e}"}
+        if _n_skip > 0:
+            _postfix["skip"] = _n_skip
+        pbar.set_postfix(_postfix)
 
     if agg["num"] == 0:
         raise RuntimeError(

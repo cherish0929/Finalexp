@@ -142,7 +142,8 @@ class LaserFieldModule(nn.Module):
             # Quadratic peak at alpha=0.5: 4*α*(1-α) ∈ [0, 1], max at α=0.5
             surface_factor = 4.0 * alpha * (1.0 - alpha)
             # Beer-Lambert depth proxy: attenuate in metal bulk (low alpha)
-            depth_atten = torch.exp(-self.kappa * (1.0 - alpha).clamp(min=0.0))
+            kappa = F.softplus(self.kappa)
+            depth_atten = torch.exp(-kappa * (1.0 - alpha).clamp(min=0.0))
             I_att = I_norm * (surface_factor + depth_atten) * 0.5
         else:
             y_max = spatial_inform[:, 3:4]
@@ -387,7 +388,7 @@ class RadiationBranch(nn.Module):
         parts = [V_field]
 
         if self.has_T and T_field is not None:
-            T_norm = T_field / 1000.0
+            T_norm = (T_field / 1000.0).clamp(-10.0, 10.0)
             T4_term = T_norm ** 4 - (self.T_ref / 1000.0) ** 4
             parts.append(T4_term)
 
@@ -611,7 +612,7 @@ class SpatialGating(nn.Module):
 
     def forward(self, V_field, laser_feat, pos_enc):
         gate_in = torch.cat([V_field, laser_feat, pos_enc], dim=-1)
-        logits = self.gate_net(gate_in)
+        logits = self.gate_net(gate_in).clamp(-30, 30)
         return torch.softmax(logits, dim=-1)
 
 
