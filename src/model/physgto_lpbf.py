@@ -943,26 +943,36 @@ class Model(nn.Module):
         if self.stepper_scheme == "euler":
             with autocast(device_type="cuda", enabled=False):
                 delta = combined.float() * dt_tensor.unsqueeze(-1).float()
-                # Bound temperature delta to prevent catastrophic spikes
                 if self.T_idx is not None:
-                    delta[..., self.T_idx] = torch.tanh(
-                        delta[..., self.T_idx] / self.max_delta_T
+                    bounded_T = torch.tanh(
+                        delta[..., self.T_idx:self.T_idx+1] / self.max_delta_T
                     ) * self.max_delta_T
+                    delta = torch.cat([
+                        delta[..., :self.T_idx],
+                        bounded_T,
+                        delta[..., self.T_idx+1:],
+                    ], dim=-1)
                 state_pred = state_in.float() + delta
         else:
             delta = combined
             if self.T_idx is not None:
-                delta = delta.clone()
-                delta[..., self.T_idx] = torch.tanh(
-                    delta[..., self.T_idx] / self.max_delta_T
+                bounded_T = torch.tanh(
+                    delta[..., self.T_idx:self.T_idx+1] / self.max_delta_T
                 ) * self.max_delta_T
+                delta = torch.cat([
+                    delta[..., :self.T_idx],
+                    bounded_T,
+                    delta[..., self.T_idx+1:],
+                ], dim=-1)
             state_pred = state_in + delta
 
-        # Clamp VoF fields to [0, 1]
+        # Clamp VoF fields to [0, 1] (out-of-place to avoid breaking autograd)
+        channels = list(state_pred.unbind(dim=-1))
         if self.alpha_idx is not None:
-            state_pred[..., self.alpha_idx] = state_pred[..., self.alpha_idx].clamp(0.0, 1.0)
+            channels[self.alpha_idx] = channels[self.alpha_idx].clamp(0.0, 1.0)
         if self.gamma_idx is not None:
-            state_pred[..., self.gamma_idx] = state_pred[..., self.gamma_idx].clamp(0.0, 1.0)
+            channels[self.gamma_idx] = channels[self.gamma_idx].clamp(0.0, 1.0)
+        state_pred = torch.stack(channels, dim=-1)
 
         return state_pred
 

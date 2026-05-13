@@ -211,16 +211,17 @@ def _compute_normal_consistency(
     pred_gx, pred_gy, pred_gz = compute_spatial_gradient_3d(fld_pred, grid_shape)
     gt_gx, gt_gy, gt_gz = compute_spatial_gradient_3d(fld_gt, grid_shape)
 
-    def _align(a, b):
-        for dim in range(a.dim()):
-            sz = min(a.shape[dim], b.shape[dim])
-            a = a.narrow(dim, 0, sz)
-            b = b.narrow(dim, 0, sz)
-        return a, b
+    # Gradients have different shapes along spatial dims (finite diff reduces by 1
+    # along the differenced axis). Trim all to the common minimum shape.
+    min_z = min(pred_gx.shape[2], pred_gy.shape[2], pred_gz.shape[2])
+    min_y = min(pred_gx.shape[3], pred_gy.shape[3], pred_gz.shape[3])
+    min_x = min(pred_gx.shape[4], pred_gy.shape[4], pred_gz.shape[4])
 
-    pred_gx, gt_gx = _align(pred_gx, gt_gx)
-    pred_gy, gt_gy = _align(pred_gy, gt_gy)
-    pred_gz, gt_gz = _align(pred_gz, gt_gz)
+    def _trim(t):
+        return t[:, :, :min_z, :min_y, :min_x, :]
+
+    pred_gx, pred_gy, pred_gz = _trim(pred_gx), _trim(pred_gy), _trim(pred_gz)
+    gt_gx, gt_gy, gt_gz = _trim(gt_gx), _trim(gt_gy), _trim(gt_gz)
 
     pred_norm_sq = pred_gx ** 2 + pred_gy ** 2 + pred_gz ** 2
     gt_norm_sq = gt_gx ** 2 + gt_gy ** 2 + gt_gz ** 2
