@@ -89,11 +89,12 @@ class LaserFieldModule(nn.Module):
     """
 
     def __init__(self, d_laser: int = 32, sigma: float = 0.05,
-                 distribution_factor: float = 3.0):
+                 distribution_factor: float = 3.0, kappa_init: float = 5.0):
         super().__init__()
         self.d_laser = d_laser
         self.sigma = sigma
         self.distribution_factor = distribution_factor
+        self.kappa = nn.Parameter(torch.tensor(kappa_init))
 
         self.enrich_mlp = MLP(input_size=5, output_size=d_laser,
                               hidden_size=d_laser, n_hidden=2,
@@ -133,15 +134,16 @@ class LaserFieldModule(nn.Module):
         I_max = I_raw.max(dim=-1, keepdim=True).values.clamp(min=1e-10)
         I_norm = I_raw / I_max
 
-        # Surface attenuation: laser is absorbed at the metal-air INTERFACE
+        # Surface attenuation: Beer-Lambert depth decay + interface peak
         # alpha_air ≈ 1 in pure air (transparent), ≈ 0 in pure metal (opaque)
-        # Peak absorption at interface (alpha ≈ 0.5)
+        # Absorption peaks at the air-metal interface (alpha ≈ 0.5)
         if alpha_air is not None:
             alpha = alpha_air.squeeze(-1)
-            # sigmoid peaks at alpha=0.5, drops in both pure air and pure metal
-            # Use (1 - alpha) as base absorption (metal absorbs), attenuated in air
-            surface_factor = torch.sigmoid((0.5 - alpha.abs().sub(0.5)) / self.sigma)
-            I_att = I_norm * surface_factor
+            # Quadratic peak at alpha=0.5: 4*α*(1-α) ∈ [0, 1], max at α=0.5
+            surface_factor = 4.0 * alpha * (1.0 - alpha)
+            # Beer-Lambert depth proxy: attenuate in metal bulk (low alpha)
+            depth_atten = torch.exp(-self.kappa * (1.0 - alpha).clamp(min=0.0))
+            I_att = I_norm * (surface_factor + depth_atten) * 0.5
         else:
             y_max = spatial_inform[:, 3:4]
             y_surface = y_max * 0.7
@@ -157,7 +159,7 @@ class LaserFieldModule(nn.Module):
         if dt_since is None:
             dt_feat = torch.zeros(bs, N, device=node_pos_abs.device)
         else:
-            dt_feat = dt_since.squeeze(-1).unsqueeze(-1).expand(-1, N)
+            dt_feat = dt_since.view(bs, 1).expand(-1, N)
 
         feat_raw = torch.stack(
             [I_att, d_norm, dy_norm, dt_feat, absorptivity.expand(-1, N)], dim=-1
@@ -849,6 +851,12 @@ class Model(nn.Module):
 
         self.aux_losses = {}
 
+        # Bounded output controls
+        self.T_idx = fields.index("T") if "T" in fields else None
+        self.alpha_idx = fields.index("alpha.air") if "alpha.air" in fields else None
+        self.gamma_idx = fields.index("gamma_liquid") if "gamma_liquid" in fields else None
+        self.max_delta_T = 500.0
+
     def _encode_time(self, time_i, dt_tensor, abs_time):
         return _encode_time_lpbf(time_i, dt_tensor, abs_time, self.pos_enc_dim)
 
@@ -916,7 +924,8 @@ class Model(nn.Module):
         v_pred = self.decoder(V_all_list, pos_enc_out)
 
         # Source-Term Correction
-        V_last = V_all_list[0][:, -1]
+        # Aggregate last block output from all fields
+        V_last = sum(V_all_list[f][:, -1] for f in range(len(V_all_list))) / len(V_all_list)
         src_delta_1 = self.source_decoder(
             V_last, laser_feat, pos_enc_out, edges_long,
             node_pos, state_in, spatial_inform
@@ -933,10 +942,27 @@ class Model(nn.Module):
 
         if self.stepper_scheme == "euler":
             with autocast(device_type="cuda", enabled=False):
-                state_pred = (state_in.float()
-                              + combined.float() * dt_tensor.unsqueeze(-1).float())
+                delta = combined.float() * dt_tensor.unsqueeze(-1).float()
+                # Bound temperature delta to prevent catastrophic spikes
+                if self.T_idx is not None:
+                    delta[..., self.T_idx] = torch.tanh(
+                        delta[..., self.T_idx] / self.max_delta_T
+                    ) * self.max_delta_T
+                state_pred = state_in.float() + delta
         else:
-            state_pred = state_in + combined
+            delta = combined
+            if self.T_idx is not None:
+                delta = delta.clone()
+                delta[..., self.T_idx] = torch.tanh(
+                    delta[..., self.T_idx] / self.max_delta_T
+                ) * self.max_delta_T
+            state_pred = state_in + delta
+
+        # Clamp VoF fields to [0, 1]
+        if self.alpha_idx is not None:
+            state_pred[..., self.alpha_idx] = state_pred[..., self.alpha_idx].clamp(0.0, 1.0)
+        if self.gamma_idx is not None:
+            state_pred[..., self.gamma_idx] = state_pred[..., self.gamma_idx].clamp(0.0, 1.0)
 
         return state_pred
 
