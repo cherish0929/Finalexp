@@ -26,6 +26,7 @@ from src.model.physgto_res_attnres import Model as GTO_res_attnres
 from src.model.physgto_attnres_multi_v3 import Model as GTO_attnres_multi_v3
 from src.model.physgto_attnres_max import Model as GTO_attnres_max
 from src.model.physgto_lpbf import Model as GTO_lpbf
+from src.model.physgto_lpbf_v2 import Model as GTO_lpbf_v2
 
 # --------------------------------------------------------------------------- #
 # Registry: model_name (str used in JSON config) → Model class
@@ -41,6 +42,7 @@ MODEL_REGISTRY = {
     "gto_attnres_multi_v3":  GTO_attnres_multi_v3,
     "gto_attnres_max":       GTO_attnres_max,
     "gto_lpbf":              GTO_lpbf,
+    "gto_lpbf_v2":           GTO_lpbf_v2,
 }
 
 __all__ = list(MODEL_REGISTRY.keys()) + ["MODEL_REGISTRY", "build_model"]
@@ -125,5 +127,27 @@ def build_model(model_cfg: dict, cond_dim: int, default_dt: float, device):
         kwargs["sharp_weight"]    = model_cfg.get("sharp_weight", 0.01)
         kwargs["stepper_scheme"]  = model_cfg.get("stepper_scheme", "euler")
         kwargs["physics_params"]  = model_cfg.get("physics_params", None)
+
+    if model_name == "gto_lpbf_v2":
+        fields = model_cfg.get("fields", model_cfg.get("_fields", ["T"]))
+        kwargs["fields"]          = fields
+        kwargs["spatial_dim"]     = model_cfg.get("spatial_dim", 10)
+        kwargs["pos_x_boost"]     = model_cfg.get("pos_x_boost", 2)
+        kwargs["n_latent"]        = model_cfg.get("n_latent", 4)
+        kwargs["n_fields"]        = model_cfg.get("n_fields", len(fields))
+        kwargs["cross_attn_heads"]= model_cfg.get("cross_attn_heads", 4)
+        kwargs["d_laser"]         = model_cfg.get("d_laser", 32)
+        kwargs["ortho_weight"]    = model_cfg.get("ortho_weight", 0.01)
+        kwargs["balance_weight"]  = model_cfg.get("balance_weight", 0.05)
+        kwargs["stepper_scheme"]  = model_cfg.get("stepper_scheme", "euler")
+        kwargs["physics_params"]  = model_cfg.get("physics_params", None)
+        kwargs["n_source_terms"]  = model_cfg.get("n_source_terms", 5)
+        kwargs["n_src_tokens"]    = model_cfg.get("n_src_tokens", 512)
+        kwargs["d_src"]           = model_cfg.get("d_src", 64)
+        kwargs["N_src_block"]     = model_cfg.get("N_src_block", 2)
+        kwargs["src_n_heads"]     = model_cfg.get("src_n_heads", 4)
+        kwargs["src_cross_heads"] = model_cfg.get("src_cross_heads", 4)
+        kwargs["src_n_token"]     = model_cfg.get("src_n_token", 64)
+        kwargs["src_n_latent"]    = model_cfg.get("src_n_latent", 2)
 
     return ModelClass(**kwargs).to(device)

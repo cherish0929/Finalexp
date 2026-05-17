@@ -29,6 +29,9 @@ from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
 
+# Reduce CUDA allocator fragmentation, especially after ckpt_probe warm-up.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
@@ -72,7 +75,7 @@ def get_dataloader(args, path_record, device_type, pf_extra_max=0):
     space_dim = model_cfg.get("space_size", 3)
     model_name = model_cfg.get("name", "PhysGTO")
 
-    if model_name == "gto_lpbf":
+    if model_name in ("gto_lpbf", "gto_lpbf_v2"):
         Datasetclass = LPBFLaserDataset
         model_cfg["_fields"] = data_cfg.get("fields", ["T"])
     elif space_dim == 3:
@@ -329,15 +332,23 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
             ckpt_table = None
 
     def _get_ckpt_threshold(actual_horizon):
-        """Look up the optimal checkpoint threshold for a given rollout length."""
+        """Look up the optimal checkpoint threshold for a given rollout length.
+
+        Strategy: find the entry whose horizon is closest to and >= actual_horizon
+        (conservative — uses a threshold probed at a longer rollout, which is always
+        safe because a longer rollout needs *more* checkpointing, not less).
+        If no entry covers actual_horizon, fall back to the largest available entry.
+        """
         if ckpt_table is None:
             return False if not cfg_ckpt else True
         if actual_horizon in ckpt_table:
             return ckpt_table[actual_horizon]
-        closest = min(ckpt_table.keys(), key=lambda h: (h < actual_horizon, abs(h - actual_horizon)))
-        if closest >= actual_horizon:
-            return ckpt_table[closest]
-        return ckpt_table.get(max(ckpt_table.keys()), True)
+        # Prefer the smallest key that is still >= actual_horizon (safe upper bound).
+        covering = [h for h in ckpt_table if h >= actual_horizon]
+        if covering:
+            return ckpt_table[min(covering)]
+        # All probed horizons are shorter — use the largest (most aggressive checkpoint).
+        return ckpt_table[max(ckpt_table.keys())]
 
     # ---- Resume ----
     start_epoch, best_val_error = 0, float("inf")
@@ -456,13 +467,22 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         except torch.cuda.OutOfMemoryError as e:
             torch.cuda.empty_cache()
             _write_error(path_record, args.name, e,
-                         context=f"train epoch {epoch + 1}/{EPOCH} — CUDA OOM (fatal, stopping)",
+                         context=f"train epoch {epoch + 1}/{EPOCH} — CUDA OOM (skipping epoch)",
                          config_path=config_path)
-            print(f"[FATAL OOM] Epoch {epoch + 1}: CUDA out of memory. Training stopped.")
-            print(f"Error details saved to: {path_record}/{args.name}_training_log.txt")
-            print(f"Full bug report saved to: {path_record}/bug.txt")
-            writer.close()
-            return
+            print(f"[OOM] Epoch {epoch + 1}: CUDA out of memory. Skipping epoch.")
+            scheduler.step()
+            consecutive_skip_errors += 1
+            if consecutive_skip_errors >= max_consecutive_skip_errors:
+                _fatal_msg = (
+                    f"[FATAL] {consecutive_skip_errors} consecutive OOM/skip epochs. "
+                    f"Training aborted at epoch {epoch + 1}/{EPOCH}."
+                )
+                print(_fatal_msg)
+                with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
+                    file.write(_fatal_msg + "\n")
+                writer.close()
+                return
+            continue
         except RuntimeError as e:
             _write_error(path_record, args.name, e,
                          context=f"train epoch {epoch + 1}/{EPOCH}",
@@ -601,13 +621,10 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
                 ema.restore(model)
                 torch.cuda.empty_cache()
                 _write_error(path_record, args.name, e,
-                             context=f"validate epoch {epoch + 1}/{EPOCH} — CUDA OOM (fatal, stopping)",
+                             context=f"validate epoch {epoch + 1}/{EPOCH} — CUDA OOM (skipping validation)",
                              config_path=config_path)
-                print(f"[FATAL OOM] Epoch {epoch + 1} validation: CUDA out of memory. Training stopped.")
-                print(f"Error details saved to: {path_record}/{args.name}_training_log.txt")
-                print(f"Full bug report saved to: {path_record}/bug.txt")
-                writer.close()
-                return
+                print(f"[OOM] Epoch {epoch + 1} validation: CUDA out of memory. Skipping validation.")
+                continue
             except Exception as e:
                 ema.restore(model)
                 torch.cuda.empty_cache()
