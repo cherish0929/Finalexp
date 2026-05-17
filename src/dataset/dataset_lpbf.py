@@ -163,8 +163,16 @@ class LPBFSlotDataset(Dataset):
         self.sample_keys = []
         self.max_start_per_file = []
 
-        for file_id, path in enumerate(self.file_paths):
-            meta = self._build_meta(path)
+        valid_paths = []
+        for path in self.file_paths:
+            try:
+                meta = self._build_meta(path)
+            except OSError as e:
+                print(f"[WARNING] 跳过损坏的 HDF5 文件: {path}\n  原因: {e}")
+                continue
+
+            file_id = len(valid_paths)
+            valid_paths.append(path)
             self.meta_cache[path] = meta
             self.max_start_per_file.append(meta["max_start"])
 
@@ -175,6 +183,14 @@ class LPBFSlotDataset(Dataset):
                 step = max(1, self.horizon // 2)
                 for start in range(1, meta["max_start"] + 1, step):
                     self.sample_keys.append((file_id, start))
+
+        skipped = len(self.file_paths) - len(valid_paths)
+        self.file_paths = valid_paths
+        if skipped > 0:
+            print(f"[WARNING] 共跳过 {skipped} 个损坏文件，"
+                  f"有效文件 {len(valid_paths)}/{len(valid_paths) + skipped}")
+        if len(valid_paths) == 0:
+            raise RuntimeError("所有 HDF5 文件均损坏，无法创建数据集")
 
         example_meta = next(iter(self.meta_cache.values()))
         self.cond_dim = example_meta["conditions"].shape[-1]

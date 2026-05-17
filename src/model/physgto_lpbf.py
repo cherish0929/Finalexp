@@ -65,6 +65,8 @@ DEFAULT_PHYSICS_PARAMS = {
     "latent_heat_vap": 9.83e6,    # J/kg
     "molar_mass": 0.0479,          # kg/mol (Ti)
     "gas_constant": 8.314,         # J/(mol·K)
+    "T_mean": 529.99,
+    "T_std": 454.54,
 }
 
 
@@ -80,21 +82,28 @@ class LaserFieldModule(nn.Module):
         node_pos_abs  [bs, N, 3]  — absolute node coords (m)
         laser_pos     [bs, 3]     — laser xyz at current timestep (m)
         laser_params  [bs, 4]     — [P_L (W), r (m), absorptivity, V_scan (m/s)]
-        alpha_air     [bs, N, 1] or None  — VoF air field (for surface attenuation)
-        spatial_inform[bs, 10]   — bounds + ds_shape + time_ref
+        alpha_air     [bs, N, 1] or None  — VoF air field (optional interface boost)
 
     Outputs:
         laser_field   [bs, N, 1]  — normalised intensity in [0, 1]
         laser_feat    [bs, N, D]  — learnable enrichment features
+
+    Attenuation:
+        - xz-plane: 2D Gaussian with configurable distribution_factor
+        - y-axis: asymmetric exponential decay from laser y-position
+          (faster upward into air, slower downward into metal)
+        - Optional alpha_air modulation: interface boost at alpha ≈ 0.5
     """
 
-    def __init__(self, d_laser: int = 32, sigma: float = 0.05,
-                 distribution_factor: float = 3.0, kappa_init: float = 5.0):
+    def __init__(self, d_laser: int = 32,
+                 distribution_factor: float = 3.0,
+                 kappa_air_init: float = 5.0,
+                 kappa_metal_init: float = 1.5):
         super().__init__()
         self.d_laser = d_laser
-        self.sigma = sigma
         self.distribution_factor = distribution_factor
-        self.kappa = nn.Parameter(torch.tensor(kappa_init))
+        self.kappa_air_raw = nn.Parameter(torch.tensor(kappa_air_init))
+        self.kappa_metal_raw = nn.Parameter(torch.tensor(kappa_metal_init))
 
         self.enrich_mlp = MLP(input_size=5, output_size=d_laser,
                               hidden_size=d_laser, n_hidden=2,
@@ -105,7 +114,6 @@ class LaserFieldModule(nn.Module):
         node_pos_abs: torch.Tensor,
         laser_pos: torch.Tensor,
         laser_params: torch.Tensor,
-        spatial_inform: torch.Tensor,
         alpha_air: Optional[torch.Tensor] = None,
         dt_since: Optional[torch.Tensor] = None,
     ):
@@ -134,21 +142,28 @@ class LaserFieldModule(nn.Module):
         I_max = I_raw.max(dim=-1, keepdim=True).values.clamp(min=1e-10)
         I_norm = I_raw / I_max
 
-        # Surface attenuation: Beer-Lambert depth decay + interface peak
-        # alpha_air ≈ 1 in pure air (transparent), ≈ 0 in pure metal (opaque)
-        # Absorption peaks at the air-metal interface (alpha ≈ 0.5)
+        # Asymmetric Y-attenuation centered at laser position
+        # dy > 0: above laser (air) → faster decay; dy < 0: below (metal) → slower decay
+        dy = y - y_laser
+        dy_norm = dy / (r + 1e-9)
+
+        kappa_air = F.softplus(self.kappa_air_raw)
+        kappa_metal = F.softplus(self.kappa_metal_raw)
+
+        # Smooth gating: transition width naturally scales with laser radius r
+        w_up = torch.sigmoid(dy_norm)
+        w_down = 1.0 - w_up
+
+        kappa_eff = w_up * kappa_air + w_down * kappa_metal
+        A_y = torch.exp(-kappa_eff * torch.abs(dy_norm))
+
+        # Optional alpha_air modulation: interface boost at alpha ≈ 0.5
         if alpha_air is not None:
             alpha = alpha_air.squeeze(-1)
-            # Quadratic peak at alpha=0.5: 4*α*(1-α) ∈ [0, 1], max at α=0.5
-            surface_factor = 4.0 * alpha * (1.0 - alpha)
-            # Beer-Lambert depth proxy: attenuate in metal bulk (low alpha)
-            kappa = F.softplus(self.kappa)
-            depth_atten = torch.exp(-kappa * (1.0 - alpha).clamp(min=0.0))
-            I_att = I_norm * (surface_factor + depth_atten) * 0.5
-        else:
-            y_max = spatial_inform[:, 3:4]
-            y_surface = y_max * 0.7
-            I_att = I_norm * torch.sigmoid((y - y_surface) / self.sigma)
+            interface_boost = 1.0 + 3.0 * alpha * (1.0 - alpha)
+            A_y = A_y * interface_boost
+
+        I_att = I_norm * A_y
 
         # Apply absorptivity
         I_att = I_att * absorptivity
@@ -324,29 +339,30 @@ class DiffusionBranch(nn.Module):
 
 
 class LaserSourceBranch(nn.Module):
-    """Branch B: Absorbed laser power. Output ≥ 0 (softplus)."""
+    """Branch B: Absorbed laser power. Output ≥ 0 (softplus). T_field in physical K."""
 
     def __init__(self, enc_dim: int, d_laser: int, has_T: bool):
         super().__init__()
         self.has_T = has_T
-        cond_dim = enc_dim
-        self.mlp = MLP(input_size=d_laser + cond_dim, output_size=enc_dim,
+        in_dim = d_laser + enc_dim + (1 if has_T else 0)
+        self.mlp = MLP(input_size=in_dim, output_size=enc_dim,
                        hidden_size=enc_dim, n_hidden=2, act='SiLU', layer_norm=True)
         self.out_proj = nn.Linear(enc_dim, 1)
 
     def forward(self, laser_feat, V_field, T_field=None):
+        parts = [laser_feat, V_field]
         if self.has_T and T_field is not None:
-            cond = T_field.expand(-1, -1, V_field.shape[-1])
-        else:
-            cond = V_field
-        h = self.mlp(torch.cat([laser_feat, cond], dim=-1))
+            # Normalize physical T to O(1) for MLP input
+            T_feat = (T_field / 1000.0).clamp(0.0, 5.0)
+            parts.append(T_feat)
+        h = self.mlp(torch.cat(parts, dim=-1))
         return F.softplus(self.out_proj(h))
 
 
 class RadiationBranch(nn.Module):
     """
     Branch C: Surface radiation Q_rad ∝ -(T^4 - T_ref^4) * |∇α|
-    Configurable T_ref.
+    T_field is in physical units (K), denormalized before this branch.
     """
 
     def __init__(self, enc_dim: int, edge_raw_dim: int, has_T: bool, has_alpha: bool,
@@ -388,9 +404,12 @@ class RadiationBranch(nn.Module):
         parts = [V_field]
 
         if self.has_T and T_field is not None:
-            T_norm = (T_field / 1000.0).clamp(-10.0, 10.0)
-            T4_term = T_norm ** 4 - (self.T_ref / 1000.0) ** 4
-            parts.append(T4_term)
+            # T_field is in physical K, scale to kK for numerical stability
+            T_kK = (T_field / 1000.0).clamp(0.0, 5.0)
+            T4_term = T_kK ** 4 - (self.T_ref / 1000.0) ** 4
+            # Normalize T4 to O(1) range (max ~625 for 5kK)
+            T4_feat = T4_term / 100.0
+            parts.append(T4_feat)
 
         if self.has_alpha and alpha_field is not None:
             grad_a = self._compute_grad_alpha(alpha_field, edges, edge_raw)
@@ -402,7 +421,7 @@ class RadiationBranch(nn.Module):
 
 
 class LatentHeatBranch(nn.Module):
-    """Branch D: Phase-change latent heat. Configurable solidus/liquidus."""
+    """Branch D: Phase-change latent heat. T_field in physical K."""
 
     def __init__(self, enc_dim: int, has_T: bool, has_gamma: bool,
                  T_solidus: float = 1877.0, T_liquidus: float = 1923.0):
@@ -428,6 +447,7 @@ class LatentHeatBranch(nn.Module):
         if self.has_gamma and gamma_field is not None:
             parts.append(gamma_field)
         elif self.has_T and T_field is not None:
+            # T_field in physical K — sigmoid transition across mushy zone
             eps = self.T_liquidus - self.T_solidus + 1.0
             phase_proxy = torch.sigmoid((T_field - self.T_solidus) / eps)
             parts.append(phase_proxy)
@@ -441,7 +461,7 @@ class RecoilPressureBranch(nn.Module):
     Branch E: Recoil pressure from metal vaporization.
     Physics: P_recoil = 0.54·P₀·exp[LvM/R·(1/Tv - 1/T)]
     Only significant when T > T_vaporization.
-    Structural bias: exponential activation on temperature ratio.
+    T_field is in physical K.
     """
 
     def __init__(self, enc_dim: int, has_T: bool, has_alpha: bool,
@@ -461,9 +481,8 @@ class RecoilPressureBranch(nn.Module):
 
         if self.has_T and T_field is not None:
             # Exponential temperature structure: significant only near/above T_vap
-            T_ratio = torch.clamp(T_field / self.T_vap, max=2.0)
-            # exp((1 - 1/T_ratio)) peaks when T >> T_vap
-            recoil_proxy = torch.exp(torch.clamp(1.0 - 1.0 / (T_ratio + 1e-6), max=5.0)) - 1.0
+            T_ratio = torch.clamp(T_field / self.T_vap, min=0.0, max=2.0)
+            recoil_proxy = torch.exp(torch.clamp(1.0 - 1.0 / (T_ratio + 1e-6), min=-5.0, max=5.0)) - 1.0
             parts.append(recoil_proxy)
 
         if self.has_alpha and alpha_field is not None:
@@ -478,6 +497,7 @@ class EvaporationBranch(nn.Module):
     Branch F: Surface evaporation heat loss.
     Physics: Q_evap ∝ exp[LvM(T-Tv)/(RTTv)] · |∇α|
     Output sign: negative (heat loss from evaporation).
+    T_field is in physical K.
     """
 
     def __init__(self, enc_dim: int, edge_raw_dim: int, has_T: bool, has_alpha: bool,
@@ -512,9 +532,9 @@ class EvaporationBranch(nn.Module):
         parts = [V_field]
 
         if self.has_T and T_field is not None:
-            # Evaporation is exponentially activated near T_vap
+            # T_field in physical K — smooth step activation near T_vap
             T_ratio = (T_field - self.T_vap) / self.T_vap
-            evap_proxy = torch.sigmoid(T_ratio * 10.0)  # smooth step near T_vap
+            evap_proxy = torch.sigmoid(T_ratio * 10.0)
             parts.append(evap_proxy)
 
         if self.has_alpha and alpha_field is not None:
@@ -645,6 +665,10 @@ class SourceTermDecoder(nn.Module):
         self.alpha_idx = fields.index("alpha.air") if self.has_alpha else None
         self.gamma_idx = fields.index("gamma_liquid") if self.has_gamma else None
 
+        # Store normalization stats for T denormalization
+        self.register_buffer("T_mean", torch.tensor(pp.get("T_mean", 529.99)))
+        self.register_buffer("T_std", torch.tensor(pp.get("T_std", 454.54)))
+
         edge_raw_dim = 2 * space_size + 1
 
         # Core branches (always created)
@@ -672,8 +696,15 @@ class SourceTermDecoder(nn.Module):
 
         self.gating = SpatialGating(self.n_branches, enc_dim, d_laser, enc_s_dim)
 
+        # Learnable output scale — initialized small to keep source corrections bounded early
+        self.output_scale = nn.Parameter(torch.tensor(0.1))
+
         self.ortho_loss = torch.tensor(0.0)
         self.balance_loss = torch.tensor(0.0)
+
+    def _denorm_T(self, T_normalized: torch.Tensor) -> torch.Tensor:
+        """Convert normalized T back to physical Kelvin for physics branches."""
+        return T_normalized * self.T_std + self.T_mean
 
     def forward(
         self,
@@ -687,25 +718,31 @@ class SourceTermDecoder(nn.Module):
     ):
         bs, N, _ = V_field.shape
 
-        T_field = state_in[..., self.T_idx:self.T_idx+1].detach() if self.has_T else None
+        # Denormalize T to physical K for physics branches
+        T_field_phys = None
+        T_field_norm = None
+        if self.has_T:
+            T_field_norm = state_in[..., self.T_idx:self.T_idx+1].detach()
+            T_field_phys = self._denorm_T(T_field_norm)
         alpha_field = state_in[..., self.alpha_idx:self.alpha_idx+1].detach() if self.has_alpha else None
         gamma_field = state_in[..., self.gamma_idx:self.gamma_idx+1].detach() if self.has_gamma else None
 
         edge_raw = get_edge_info(edges, node_pos)
 
-        # Evaluate all branches
-        out_diff = self.diffusion(V_field, edges, edge_raw, T_field, gamma_field)
-        out_laser = self.laser_src(laser_feat, V_field, T_field)
-        out_rad = self.radiation(V_field, edges, edge_raw, T_field, alpha_field, spatial_inform)
-        out_latent = self.latent(V_field, T_field, gamma_field)
-        out_recoil = self.recoil(V_field, T_field, alpha_field)
-        out_evap = self.evaporation(V_field, edges, edge_raw, T_field, alpha_field)
+        # Diffusion uses normalized T (O(1) scale differences)
+        # All other physics branches use physical T (Kelvin) for correct thresholds
+        out_diff = self.diffusion(V_field, edges, edge_raw, T_field_norm, gamma_field)
+        out_laser = self.laser_src(laser_feat, V_field, T_field_phys)
+        out_rad = self.radiation(V_field, edges, edge_raw, T_field_phys, alpha_field, spatial_inform)
+        out_latent = self.latent(V_field, T_field_phys, gamma_field)
+        out_recoil = self.recoil(V_field, T_field_phys, alpha_field)
+        out_evap = self.evaporation(V_field, edges, edge_raw, T_field_phys, alpha_field)
         out_resid = self.residual(V_field)
 
         branches = [out_diff, out_laser, out_rad, out_latent, out_recoil, out_evap, out_resid]
 
         if self.has_alpha and self.interface_evo is not None:
-            out_evo = self.interface_evo(V_field, alpha_field, edges, edge_raw, T_field)
+            out_evo = self.interface_evo(V_field, alpha_field, edges, edge_raw, T_field_phys)
             out_sharp = self.interface_sharp(V_field, alpha_field)
             branches += [out_evo, out_sharp]
 
@@ -714,6 +751,9 @@ class SourceTermDecoder(nn.Module):
         branch_stack = torch.cat(branches, dim=-1)
         delta = (branch_stack * weights).sum(dim=-1, keepdim=True)
 
+        # Scale output — keeps corrections bounded during early training
+        delta = delta * self.output_scale
+
         self._compute_aux_losses(branches, weights)
 
         return delta
@@ -721,13 +761,17 @@ class SourceTermDecoder(nn.Module):
     def _compute_aux_losses(self, branches, weights):
         bs, N, _ = branches[0].shape
         bstack = torch.cat(branches, dim=-1)
-        eps = 1e-8
-        # Normalize per-batch (dim=1 is node dimension)
-        normed = bstack / (bstack.norm(dim=1, keepdim=True) + eps)
-        gram = torch.einsum('bni,bnj->bij', normed, normed) / N
-        eye = torch.eye(self.n_branches, device=gram.device).unsqueeze(0)
-        self.ortho_loss = ((gram - eye) ** 2).mean()
+        eps = 1e-6
 
+        # Orthogonality: encourage diverse branch outputs
+        # Use detached branch outputs to avoid aux loss destabilizing main grad flow
+        with torch.no_grad():
+            normed = bstack / (bstack.norm(dim=1, keepdim=True) + eps)
+            gram = torch.einsum('bni,bnj->bij', normed, normed) / N
+            eye = torch.eye(self.n_branches, device=gram.device).unsqueeze(0)
+            self.ortho_loss = ((gram - eye) ** 2).mean()
+
+        # Balance: encourage uniform gate usage (maximize entropy)
         entropy = -(weights * torch.log(weights + eps)).sum(dim=-1).mean()
         self.balance_loss = -entropy
 
@@ -856,7 +900,8 @@ class Model(nn.Module):
         self.T_idx = fields.index("T") if "T" in fields else None
         self.alpha_idx = fields.index("alpha.air") if "alpha.air" in fields else None
         self.gamma_idx = fields.index("gamma_liquid") if "gamma_liquid" in fields else None
-        self.max_delta_T = 500.0
+        # max_delta_T in normalized T space: 2.0 ≈ 900K per step (generous for dt=2e-5s)
+        self.max_delta_T = 2.0
 
     def _encode_time(self, time_i, dt_tensor, abs_time):
         return _encode_time_lpbf(time_i, dt_tensor, abs_time, self.pos_enc_dim)
@@ -900,7 +945,7 @@ class Model(nn.Module):
                 and laser_params is not None):
             alpha_for_laser = alpha_air_in
             laser_field, laser_feat = self.laser_module(
-                node_pos_abs, laser_pos, laser_params, spatial_inform, alpha_for_laser
+                node_pos_abs, laser_pos, laser_params, alpha_for_laser
             )
         else:
             laser_field = torch.zeros(bs, N, 1, device=device)
