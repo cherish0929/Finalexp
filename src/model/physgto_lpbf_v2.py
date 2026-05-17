@@ -79,15 +79,29 @@ class SwiGLU(nn.Module):
 # Source-Term Feature Extractors (per-node, before compression)
 # =============================================================================
 
-class DiffusionExtractor(nn.Module):
-    """GNN neighbor differencing — captures Laplacian-like local structure."""
+class FusedEdgeExtractor(nn.Module):
+    """Fused diffusion + convection extractor sharing edge gather operations.
+
+    Diffusion: symmetric neighbor differencing (V_r - V_s) → Laplacian-like.
+    Convection: directional (V_s, V_r-V_s, edge_raw) with attention weighting.
+    Single gather of V_s and V_r serves both branches.
+    """
 
     def __init__(self, enc_dim: int, d_src: int, edge_raw_dim: int):
         super().__init__()
-        self.msg_mlp = MLP(input_size=enc_dim + edge_raw_dim, output_size=d_src,
-                           hidden_size=d_src, n_hidden=1, act='SiLU', layer_norm=True)
-        self.node_mlp = MLP(input_size=enc_dim + d_src, output_size=d_src,
+        # Diffusion branch
+        self.diff_msg = MLP(input_size=enc_dim + edge_raw_dim, output_size=d_src,
                             hidden_size=d_src, n_hidden=1, act='SiLU', layer_norm=True)
+        self.diff_node = MLP(input_size=enc_dim + d_src, output_size=d_src,
+                             hidden_size=d_src, n_hidden=1, act='SiLU', layer_norm=True)
+        # Convection branch
+        self.conv_edge = MLP(input_size=enc_dim * 2 + edge_raw_dim, output_size=d_src,
+                             hidden_size=d_src, n_hidden=1, act='SiLU', layer_norm=True)
+        self.conv_attn = nn.Sequential(
+            nn.Linear(d_src, d_src // 4), nn.SiLU(), nn.Linear(d_src // 4, 1)
+        )
+        self.conv_node = MLP(input_size=enc_dim + d_src, output_size=d_src,
+                             hidden_size=d_src, n_hidden=1, act='SiLU', layer_norm=True)
 
     def forward(self, V, edges, edge_raw):
         bs, N, D = V.shape
@@ -96,44 +110,29 @@ class DiffusionExtractor(nn.Module):
 
         idx_s = s_idx.unsqueeze(-1).expand(-1, -1, D)
         idx_r = r_idx.unsqueeze(-1).expand(-1, -1, D)
-        diff = torch.gather(V, 1, idx_r) - torch.gather(V, 1, idx_s)
+        V_s = torch.gather(V, 1, idx_s)
+        V_r = torch.gather(V, 1, idx_r)
+        diff = V_r - V_s
 
-        msg = self.msg_mlp(torch.cat([diff, edge_raw], dim=-1))
+        # --- Diffusion: symmetric scatter of (V_r - V_s) messages ---
+        msg = self.diff_msg(torch.cat([diff, edge_raw], dim=-1))
         col = r_idx.unsqueeze(-1).expand_as(msg)
-        agg = scatter_add(msg, col, dim=1, dim_size=N)
+        diff_agg = scatter_add(msg, col, dim=1, dim_size=N)
+        out_diff = self.diff_node(torch.cat([V, diff_agg], dim=-1))
+        del msg, diff_agg
 
-        return self.node_mlp(torch.cat([V, agg], dim=-1))
+        # --- Convection: attention-weighted directional edges ---
+        conv_feat = self.conv_edge(torch.cat([V_s, diff, edge_raw], dim=-1))
+        del V_s, V_r, diff
 
-
-class ConvectionExtractor(nn.Module):
-    """Directional edge gradients with signed displacement — convective transport."""
-
-    def __init__(self, enc_dim: int, d_src: int, edge_raw_dim: int):
-        super().__init__()
-        self.edge_mlp = MLP(input_size=enc_dim * 2 + edge_raw_dim, output_size=d_src,
-                            hidden_size=d_src, n_hidden=1, act='SiLU', layer_norm=True)
-        self.attn_net = nn.Sequential(
-            nn.Linear(d_src, d_src // 4), nn.SiLU(), nn.Linear(d_src // 4, 1)
+        logits = self.conv_attn(conv_feat).squeeze(-1).clamp(-30, 30)
+        alpha = scatter_softmax(logits, r_idx, dim=1)
+        conv_agg = scatter_add(
+            alpha.unsqueeze(-1) * conv_feat, col, dim=1, dim_size=N
         )
-        self.node_mlp = MLP(input_size=enc_dim + d_src, output_size=d_src,
-                            hidden_size=d_src, n_hidden=1, act='SiLU', layer_norm=True)
+        out_conv = self.conv_node(torch.cat([V, conv_agg], dim=-1))
 
-    def forward(self, V, edges, edge_raw):
-        bs, N, D = V.shape
-        s_idx = edges[..., 0].unsqueeze(-1).expand(-1, -1, D)
-        r_idx_flat = edges[..., 1]
-
-        V_s = torch.gather(V, 1, s_idx)
-        V_r = torch.gather(V, 1, r_idx_flat.unsqueeze(-1).expand(-1, -1, D))
-        edge_feat = self.edge_mlp(torch.cat([V_s, V_r - V_s, edge_raw], dim=-1))
-        del V_s, V_r
-
-        logits = self.attn_net(edge_feat).squeeze(-1).clamp(-30, 30)
-        alpha = scatter_softmax(logits, r_idx_flat, dim=1)
-        col = r_idx_flat.unsqueeze(-1).expand_as(edge_feat)
-        agg = scatter_add(alpha.unsqueeze(-1) * edge_feat, col, dim=1, dim_size=N)
-
-        return self.node_mlp(torch.cat([V, agg], dim=-1))
+        return out_diff, out_conv
 
 
 class SourceSinkExtractor(nn.Module):
@@ -191,6 +190,7 @@ class SourceTermProjector(nn.Module):
     """
     For each of 5 source terms, extract per-node features and compress
     to n_src tokens via cross-attention with learned queries.
+    Uses fused edge extractor for diffusion+convection (shared gather).
     """
 
     def __init__(
@@ -210,13 +210,10 @@ class SourceTermProjector(nn.Module):
         self.n_src_tokens = n_src_tokens
         edge_raw_dim = 2 * space_size + 1
 
-        self.extractors = nn.ModuleList([
-            DiffusionExtractor(enc_dim, d_src, edge_raw_dim),
-            ConvectionExtractor(enc_dim, d_src, edge_raw_dim),
-            SourceSinkExtractor(enc_dim, d_src, d_laser, n_fields),
-            SurfaceExtractor(enc_dim, d_src, n_fields, alpha_idx),
-            ResidualExtractor(enc_dim, d_src),
-        ])
+        self.edge_extractor = FusedEdgeExtractor(enc_dim, d_src, edge_raw_dim)
+        self.source_sink = SourceSinkExtractor(enc_dim, d_src, d_laser, n_fields)
+        self.surface = SurfaceExtractor(enc_dim, d_src, n_fields, alpha_idx)
+        self.residual = ResidualExtractor(enc_dim, d_src)
 
         self.queries = nn.ParameterList([
             nn.Parameter(torch.empty(n_src_tokens, d_src))
@@ -239,19 +236,20 @@ class SourceTermProjector(nn.Module):
 
     def forward(self, V_last, laser_feat, state_in, edges, node_pos):
         edge_raw = get_edge_info(edges, node_pos)
+
+        # Fused diffusion + convection (single edge gather)
+        feat_diff, feat_conv = self.edge_extractor(V_last, edges, edge_raw)
+
+        # Non-edge extractors
+        feat_src = self.source_sink(V_last, laser_feat, state_in)
+        feat_surf = self.surface(V_last, state_in)
+        feat_res = self.residual(V_last)
+
+        all_feats = [feat_diff, feat_conv, feat_src, feat_surf, feat_res]
         tokens = []
 
         for k in range(self.n_source_terms):
-            if k <= 1:
-                feat = self.extractors[k](V_last, edges, edge_raw)
-            elif k == 2:
-                feat = self.extractors[k](V_last, laser_feat, state_in)
-            elif k == 3:
-                feat = self.extractors[k](V_last, state_in)
-            else:
-                feat = self.extractors[k](V_last)
-
-            feat = self.ln_feats[k](feat)
+            feat = self.ln_feats[k](all_feats[k])
             bs = feat.shape[0]
             Q = self.ln_queries[k](self.queries[k].unsqueeze(0).expand(bs, -1, -1))
             S_k, _ = self.compress_attns[k](Q, feat, feat)
@@ -573,6 +571,7 @@ class Model(nn.Module):
         )
 
         self.aux_losses = {}
+        self._internal_ckpt = False
 
         # Bounded output controls
         self.T_idx = fields.index("T") if "T" in fields else None
@@ -582,6 +581,12 @@ class Model(nn.Module):
 
     def _encode_time(self, time_i, dt_tensor, abs_time):
         return _encode_time_lpbf(time_i, dt_tensor, abs_time, self.pos_enc_dim)
+
+    def _mixer_wrapper(self, *args):
+        """Wrapper for checkpoint: unpacks positional args into (V_list, E, edges, pos_enc)."""
+        V_list = list(args[:self.n_fields])
+        E, edges, pos_enc = args[self.n_fields], args[self.n_fields + 1], args[self.n_fields + 2]
+        return self.mixer(V_list, E, edges, pos_enc)
 
     def forward(
         self,
@@ -639,8 +644,14 @@ class Model(nn.Module):
             conditions, edges_long, spatial_inform, laser_feat
         )
 
-        # Multi-Field Mixer
-        V_all_list = self.mixer(V_list, E, edges_long, pos_enc_out)
+        # Multi-Field Mixer (optionally checkpointed to save memory)
+        if self._internal_ckpt and self.training:
+            V_all_list = checkpoint(
+                self._mixer_wrapper, *V_list, E, edges_long, pos_enc_out,
+                use_reentrant=False,
+            )
+        else:
+            V_all_list = self.mixer(V_list, E, edges_long, pos_enc_out)
 
         # Base Decoder
         v_pred = self.decoder(V_all_list, pos_enc_out)
@@ -738,6 +749,9 @@ class Model(nn.Module):
         laser_traj=None,
         abs_time_seq=None,
     ):
+        # Enable internal mixer checkpointing when AR-level checkpointing is used
+        self._internal_ckpt = bool(check_point) and self.training
+
         state_t = state_in
         outputs = []
         T = time_seq.shape[1]
